@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: reposage-redis
+    ports:
+      - "6379:6379"
+    restart: always
+    command: redis-server --save 60 1 --loglevel warning
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: reposage-chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    restart: always
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: reposage-backend
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - REDIS_URL=redis://redis:6379
+      - CHROMA_URL=http://chromadb:8000
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      - redis
+      - chromadb
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: reposage-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: always
