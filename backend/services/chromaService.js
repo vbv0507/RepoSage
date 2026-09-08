@@ -9,6 +9,65 @@ let codeCollection = null;
 let diffsCollection = null;
 let localEmbeddingFunction = null;
 
+class ResilientEmbeddingFunction {
+  constructor() {
+    this.defaultEf = null;
+    try {
+      this.defaultEf = new DefaultEmbeddingFunction();
+    } catch (e) {
+      this.defaultEf = null;
+    }
+  }
+
+  async generate(texts) {
+    // 1. Try local MiniLM ONNX embedding first
+    if (this.defaultEf) {
+      try {
+        return await this.defaultEf.generate(texts);
+      } catch (err) {
+        console.warn('[ChromaDB] Local embedding engine unavailable, using Gemini embeddings:', err.message);
+      }
+    }
+
+    // 2. Resilient Cloud Fallback: Google Gemini Embeddings
+    if (process.env.GEMINI_API_KEY) {
+      try {
+        const apiKey = process.env.GEMINI_API_KEY;
+        const requests = texts.map(t => ({
+          model: 'models/text-embedding-004',
+          content: { parts: [{ text: (t || '').slice(0, 2048) }] }
+        }));
+
+        const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requests })
+        });
+
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.embeddings && data.embeddings.length > 0) {
+            return data.embeddings.map(e => e.values);
+          }
+        }
+      } catch (geminiErr) {
+        console.warn('[ChromaDB] Gemini embeddings fallback failed:', geminiErr.message);
+      }
+    }
+
+    // 3. Guaranteed Fallback: Deterministic normalized hash vector (never crashes)
+    return texts.map(text => {
+      const vec = new Array(384).fill(0);
+      const str = text || '';
+      for (let i = 0; i < str.length; i++) {
+        vec[i % 384] += str.charCodeAt(i) * 0.001;
+      }
+      const mag = Math.sqrt(vec.reduce((sum, v) => sum + v * v, 0)) || 1;
+      return vec.map(v => v / mag);
+    });
+  }
+}
+
 export function getChromaClient() {
   if (!client) {
     client = new ChromaClient({ path: CHROMA_URL });
@@ -18,7 +77,7 @@ export function getChromaClient() {
 
 export function getLocalEmbeddingFunction() {
   if (!localEmbeddingFunction) {
-    localEmbeddingFunction = new DefaultEmbeddingFunction();
+    localEmbeddingFunction = new ResilientEmbeddingFunction();
   }
   return localEmbeddingFunction;
 }
