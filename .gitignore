@@ -2,11 +2,17 @@
 node_modules/
 package-lock.json
 
-# Environment variables & secrets
+# Environment variables & secrets (CRITICAL: Never commit .env files)
 .env
 .env.local
 .env.*.local
 *.env
+backend/.env
+frontend/.env
+
+# Dynamic Ingestion & Cloned Repositories (RepoSage temporary analysis clone target)
+cloned_repos/
+backend/cloned_repos/
 
 # Vector DB & Cache Storage
 chroma_data/
@@ -15,17 +21,24 @@ backend/chroma_data/
 *.parquet
 dump.rdb
 
+# Build outputs & Generated Artifacts
+dist/
+dist_check/
+frontend/dist/
+frontend/dist_check/
+build/
+.cache/
+*.pdf
+test_output.pdf
+test-*.js
+
 # Logs
 *.log
 npm-debug.log*
-
-# Build outputs
-dist/
-build/
-.cache/
 
 # OS & IDE
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+

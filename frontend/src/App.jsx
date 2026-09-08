@@ -3,11 +3,12 @@ import Header from './components/Header';
 import RepoIngestion from './components/RepoIngestion';
 import ArchitectureGraph from './components/ArchitectureGraph';
 import ChatCopilot from './components/ChatCopilot';
+import CodeTutorial from './components/CodeTutorial';
 
 export default function App() {
   const [health, setHealth] = useState(null);
   const [activeRepo, setActiveRepo] = useState('d:/new/ai_agent/RAG/project-1-chrome-extension');
-  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'graph'
+  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'graph' | 'tutorial'
 
   useEffect(() => {
     fetchHealth();
@@ -44,7 +45,7 @@ export default function App() {
 
         {/* Minimal Tab Switcher */}
         <div style={{
-          maxWidth: '1100px',
+          maxWidth: '1180px',
           margin: '0 auto 16px auto',
           display: 'flex',
           gap: '4px',
@@ -74,14 +75,30 @@ export default function App() {
           >
             Module Dependencies
           </button>
+
+          <button
+            onClick={() => setActiveTab('tutorial')}
+            className="btn"
+            style={{
+              backgroundColor: activeTab === 'tutorial' ? '#27272a' : 'transparent',
+              color: activeTab === 'tutorial' ? 'var(--text-primary)' : 'var(--text-muted)',
+              fontSize: '13px'
+            }}
+          >
+            Architecture Tutorial
+          </button>
         </div>
 
-        {/* Tab Content */}
-        {activeTab === 'chat' ? (
+        {/* Tab Content — always mounted, visibility toggled via CSS to preserve state across tab switches */}
+        <div style={{ display: activeTab === 'chat' ? 'block' : 'none' }}>
           <ChatCopilot activeRepo={activeRepo} />
-        ) : (
+        </div>
+        <div style={{ display: activeTab === 'graph' ? 'block' : 'none' }}>
           <ArchitectureGraph activeRepo={activeRepo} />
-        )}
+        </div>
+        <div style={{ display: activeTab === 'tutorial' ? 'block' : 'none' }}>
+          <CodeTutorial activeRepo={activeRepo} />
+        </div>
       </main>
     </div>
   );

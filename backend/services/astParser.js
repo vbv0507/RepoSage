@@ -4,7 +4,7 @@ import path from 'path';
 const IGNORED_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '.next', '.nuxt',
   'coverage', '.venv', 'venv', 'env', '__pycache__', '.idea',
-  '.vscode', 'bin', 'obj', 'target', 'chroma_data'
+  '.vscode', 'bin', 'obj', 'target', 'chroma_data', 'cloned_repos'
 ]);
 
 const IGNORED_FILES = new Set([
@@ -17,6 +17,24 @@ const CODE_EXTENSIONS = new Set([
   '.py', '.go', '.java', '.cpp', '.c', '.h', '.cs',
   '.rs', '.php', '.rb', '.sql', '.json', '.yaml', '.yml', '.md'
 ]);
+
+/**
+ * Check if a file should be ignored (e.g. minified or bundled files)
+ */
+function isIgnoredFile(filename) {
+  if (IGNORED_FILES.has(filename)) return true;
+  const lower = filename.toLowerCase();
+  return (
+    lower.endsWith('.min.js') ||
+    lower.endsWith('.min.mjs') ||
+    lower.endsWith('.umd.js') ||
+    lower.endsWith('.bundle.js') ||
+    lower.endsWith('.chunk.js') ||
+    lower.endsWith('.min.css') ||
+    lower.endsWith('.map') ||
+    lower.endsWith('.lock')
+  );
+}
 
 /**
  * Scan directory recursively for source files
@@ -45,8 +63,16 @@ export function scanDirectory(dirPath, maxFiles = 200) {
         }
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
-        if (!IGNORED_FILES.has(entry.name) && CODE_EXTENSIONS.has(ext)) {
-          fileList.push(fullPath);
+        if (!isIgnoredFile(entry.name) && CODE_EXTENSIONS.has(ext)) {
+          // Skip files > 350KB (vendor bundles, compiled libraries, large data dumps)
+          try {
+            const stat = fs.statSync(fullPath);
+            if (stat.size <= 350 * 1024) {
+              fileList.push(fullPath);
+            }
+          } catch (e) {
+            fileList.push(fullPath);
+          }
         }
       }
     }
@@ -75,8 +101,26 @@ export function parseCodeFile(filePath, repoRoot) {
   const imports = [];
   const exports = [];
 
+  // Quick check for minified file (any line > 1000 chars)
+  const hasMinifiedLines = lines.some(l => l.length > 1000);
+  if (hasMinifiedLines) {
+    return {
+      filePath: relativePath,
+      imports: [],
+      chunks: [{
+        filePath: relativePath,
+        name: path.basename(relativePath),
+        type: 'module',
+        startLine: 1,
+        endLine: Math.min(lines.length, 50),
+        code: content.slice(0, 1500),
+        summary: `Minified module: ${relativePath}`
+      }]
+    };
+  }
+
   // Extract imports
-  for (let i = 0; i < lines.length; i++) {
+  for (let i = 0; i < Math.min(lines.length, 200); i++) {
     const line = lines[i].trim();
     // JS/TS: import ... from '...' or require('...')
     const jsImportMatch = line.match(/(?:import\s+.*?from\s+['"]([^'"]+)['"]|require\(['"]([^'"]+)['"]\))/);
@@ -108,7 +152,7 @@ export function parseCodeFile(filePath, repoRoot) {
       type: 'module',
       startLine: 1,
       endLine: lines.length,
-      code: content.slice(0, 3000), // Cap for token budget
+      code: content.slice(0, 2000), // Cap for token budget
       summary: `File: ${relativePath}`
     });
   }
@@ -137,7 +181,7 @@ function extractJavaScriptBlocks(content, lines, relativePath, chunks) {
     const lineNum = content.substring(0, startIndex).split('\n').length;
     // Extract snippet (up to 40 lines or closing block)
     const blockLines = lines.slice(lineNum - 1, lineNum + 45);
-    const codeSnippet = blockLines.join('\n');
+    const codeSnippet = blockLines.join('\n').slice(0, 2000);
 
     chunks.push({
       filePath: relativePath,
@@ -165,7 +209,7 @@ function extractPythonBlocks(content, lines, relativePath, chunks) {
 
     const lineNum = content.substring(0, startIndex).split('\n').length;
     const blockLines = lines.slice(lineNum - 1, lineNum + 40);
-    const codeSnippet = blockLines.join('\n');
+    const codeSnippet = blockLines.join('\n').slice(0, 2000);
 
     chunks.push({
       filePath: relativePath,
@@ -192,7 +236,7 @@ function extractGenericBlocks(content, lines, relativePath, chunks) {
       type: 'block',
       startLine: i + 1,
       endLine: Math.min(i + chunkSize, lines.length),
-      code: slice.join('\n'),
+      code: slice.join('\n').slice(0, 2000),
       summary: `Section of ${relativePath} (lines ${i + 1}-${Math.min(i + chunkSize, lines.length)})`
     });
   }

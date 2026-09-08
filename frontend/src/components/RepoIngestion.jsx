@@ -21,7 +21,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
       try {
         const data = JSON.parse(event.data);
 
-        if (data.step === 'start' || data.step === 'parsing' || data.step === 'graph' || data.step === 'embedding_code' || data.step === 'git_archaeology') {
+        if (data.message) {
           setCurrentStep(data.message);
         } else if (data.step === 'parsing_progress') {
           setCurrentStep(`Parsing files (${data.current}/${data.total})...`);
@@ -55,17 +55,26 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
             Codebase Ingestion
           </h2>
           <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '2px' }}>
-            Specify the repository folder to parse AST structures and Git diffs.
+            Enter a local folder path or paste any public <strong>GitHub URL</strong>.
           </p>
         </div>
 
-        <button
-          className="btn btn-secondary"
-          onClick={() => setRepoPath('d:/new/ai_agent/RAG/project-1-chrome-extension')}
-          style={{ fontSize: '12px' }}
-        >
-          Use Current Repo
-        </button>
+        <div style={{ display: 'flex', gap: '6px' }}>
+          <button
+            className="btn btn-secondary"
+            onClick={() => setRepoPath('d:/new/ai_agent/RAG/project-1-chrome-extension')}
+            style={{ fontSize: '11.5px', padding: '3px 8px' }}
+          >
+            Current Repo
+          </button>
+          <button
+            className="btn btn-secondary"
+            onClick={() => setRepoPath('https://github.com/expressjs/express')}
+            style={{ fontSize: '11.5px', padding: '3px 8px' }}
+          >
+            expressjs/express
+          </button>
+        </div>
       </div>
 
       <div style={{ display: 'flex', gap: '8px' }}>
@@ -73,7 +82,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
           type="text"
           value={repoPath}
           onChange={(e) => setRepoPath(e.target.value)}
-          placeholder="Repository directory path..."
+          placeholder="e.g. https://github.com/expressjs/express or D:/projects/my-app"
           disabled={isIngesting}
           style={{
             flex: 1,

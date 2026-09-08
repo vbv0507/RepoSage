@@ -9,11 +9,11 @@ const LAZY_COMMIT_PATTERNS = [
 
 /**
  * Extract Git commit history and synthesize AI Intent Summaries from raw diffs
+ * Batches lazy commits into a SINGLE LLM prompt to prevent rate limits!
  */
 export async function analyzeGitArchaeology(repoPath, maxCommits = 15) {
   const git = simpleGit(repoPath);
 
-  // Check if directory is a valid git repository
   let isRepo = false;
   try {
     isRepo = await git.checkIsRepo();
@@ -35,45 +35,57 @@ export async function analyzeGitArchaeology(repoPath, maxCommits = 15) {
   }
 
   const results = [];
-  let chatModel = null;
-  try {
-    chatModel = await getChatModel();
-  } catch (e) {
-    // LLM not configured yet
-  }
+  const lazyCommits = [];
 
   for (const commit of log.all) {
     let diff = '';
     try {
       diff = await git.show([commit.hash, '--stat', '-p']);
-      // Cap diff to prevent massive prompt overflow
-      diff = diff.slice(0, 3000);
+      diff = diff.slice(0, 1500);
     } catch (e) {
       diff = '';
     }
 
     const isLazy = isLazyMessage(commit.message);
-    let intentSummary = commit.message;
+    const shortHash = commit.hash.slice(0, 7);
 
-    // If commit message is lazy/uninformative AND LLM is available, synthesize intent from diff!
-    if (isLazy && chatModel && diff.length > 50) {
-      try {
-        intentSummary = await synthesizeDiffIntent(chatModel, commit.message, diff);
-      } catch (err) {
-        intentSummary = `Code change: ${commit.message}`;
-      }
-    }
-
-    results.push({
-      hash: commit.hash.slice(0, 7),
+    const record = {
+      hash: shortHash,
       fullHash: commit.hash,
       author: commit.author_name,
       date: commit.date,
       rawMessage: commit.message,
-      intentSummary: intentSummary,
+      intentSummary: commit.message,
       isSynthesized: isLazy,
-      diffSnippet: diff.slice(0, 1000)
-    });
+      diffSnippet: diff.slice(0, 800)
+    };
+
+    results.push(record);
+
+    if (isLazy && diff.length > 50) {
+      lazyCommits.push({
+        hash: shortHash,
+        rawMessage: commit.message,
+        diffSnippet: diff.slice(0, 1200)
+      });
+    }
+  }
+
+  // Single batched LLM call for all lazy commits to conserve rate limits
+  if (lazyCommits.length > 0) {
+    try {
+      const chatModel = await getChatModel();
+      if (chatModel) {
+        const intentMap = await batchSynthesizeDiffIntents(chatModel, lazyCommits);
+        for (const item of results) {
+          if (intentMap[item.hash]) {
+            item.intentSummary = intentMap[item.hash];
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Git Archaeology] Batch intent synthesis skipped:', e.message);
+    }
   }
 
   return results;
@@ -92,19 +104,30 @@ function isLazyMessage(msg) {
 }
 
 /**
- * Use LLM to analyze the code diff and explain what actually changed and why
+ * Single batched call to synthesize intent for all lazy commits at once
  */
-async function synthesizeDiffIntent(chatModel, rawMsg, diff) {
-  const prompt = `You are an expert software architect performing Git code archaeology.
-A developer committed code with the vague commit message: "${rawMsg}".
-Analyze the following code diff and explain what architectural change was actually made and its likely intent in 1 to 2 concise sentences.
+async function batchSynthesizeDiffIntents(chatModel, lazyCommits) {
+  const commitsPrompt = lazyCommits.map(c => 
+    `Commit [${c.hash}] (Message: "${c.rawMessage}"):\nDiff snippet:\n${c.diffSnippet}`
+  ).join('\n---\n');
 
-Code Diff:
-${diff}
+  const prompt = `You are a Principal Software Architect performing Git archaeology.
+The following commits have vague or uninformative commit messages.
+For each commit, analyze its diff snippet and provide a 1-sentence summary of the actual architectural intent and what changed.
 
-Concise Architectural Summary:`;
+${commitsPrompt}
 
-  const response = await chatModel.invoke(prompt);
-  const text = typeof response.content === 'string' ? response.content : response.content?.[0]?.text || '';
-  return text.trim() || rawMsg;
+Respond strictly with valid JSON mapping each commit hash to its 1-sentence architectural summary, example:
+{
+  "${lazyCommits[0].hash}": "Architectural explanation of this change."
+}`;
+
+  try {
+    const response = await chatModel.invoke(prompt);
+    const text = typeof response.content === 'string' ? response.content : response.content?.[0]?.text || '';
+    const cleanJson = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+    return JSON.parse(cleanJson);
+  } catch (err) {
+    return {};
+  }
 }

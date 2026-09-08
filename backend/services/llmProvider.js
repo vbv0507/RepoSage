@@ -38,6 +38,70 @@ export async function getEmbeddings() {
   }
 }
 
+/**
+ * Embed an array of texts with automatic batching and rate-limit (429) backoff/retry
+ */
+export async function embedTextsWithRetry(texts, onProgress = () => {}) {
+  if (!texts || texts.length === 0) return [];
+  const model = await getEmbeddings();
+  const provider = (process.env.LLM_PROVIDER || 'gemini').toLowerCase();
+
+  if (provider === 'gemini') {
+    const embeddings = [];
+    const BATCH_SIZE = 15;
+
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const slice = texts.slice(i, i + BATCH_SIZE);
+      let attempts = 0;
+      let success = false;
+
+      while (!success && attempts < 6) {
+        attempts++;
+        try {
+          const req = {
+            requests: slice.map(t => ({
+              content: { parts: [{ text: (t || '').slice(0, 2000) }] },
+              model: 'models/gemini-embedding-001'
+            }))
+          };
+          const res = await model.client.batchEmbedContents(req);
+          if (res && res.embeddings && res.embeddings.length === slice.length) {
+            const vectors = res.embeddings.map(e => e.values);
+            if (vectors.every(v => Array.isArray(v) && v.length > 0)) {
+              embeddings.push(...vectors);
+              success = true;
+              break;
+            }
+          }
+          throw new Error('Incomplete vector embeddings received from Gemini');
+        } catch (err) {
+          const is429 = err.message && (err.message.includes('429') || err.message.includes('Quota exceeded'));
+          if (is429 && attempts < 6) {
+            const match = err.message.match(/retry in ([0-9.]+)s/i);
+            const waitSec = match ? Math.max(Math.ceil(parseFloat(match[1])) + 2, 20) : 20;
+            onProgress({
+              step: 'embedding_progress',
+              message: `Gemini API quota rate-limited (${i}/${texts.length}). Waiting ${waitSec}s before resuming...`
+            });
+            await new Promise(r => setTimeout(r, waitSec * 1000));
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      // 400ms pause between batches to smooth request bursts
+      if (i + BATCH_SIZE < texts.length) {
+        await new Promise(r => setTimeout(r, 400));
+      }
+    }
+
+    return embeddings;
+  } else {
+    return await model.embedDocuments(texts.map(t => (t || '').slice(0, 2000)));
+  }
+}
+
 export async function getChatModel() {
   if (chatModelInstance) return chatModelInstance;
 
@@ -51,9 +115,10 @@ export async function getChatModel() {
     const { ChatGoogleGenerativeAI } = await import('@langchain/google-genai');
     chatModelInstance = new ChatGoogleGenerativeAI({
       apiKey: apiKey,
-      model: 'gemini-2.5-flash',
+      model: process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
       temperature: 0.2,
-      maxOutputTokens: 8192
+      maxOutputTokens: 8192,
+      maxRetries: 2
     });
     return chatModelInstance;
   } else if (provider === 'openai') {
@@ -78,6 +143,6 @@ export function checkConfigStatus() {
   return {
     provider,
     configured: Boolean(provider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.OPENAI_API_KEY),
-    model: provider === 'gemini' ? 'gemini-2.5-flash' : 'gpt-4o-mini'
+    model: provider === 'gemini' ? (process.env.GEMINI_MODEL || 'gemini-flash-latest') : 'gpt-4o-mini'
   };
 }

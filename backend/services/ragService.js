@@ -1,8 +1,45 @@
-import { getEmbeddings, getChatModel } from './llmProvider.js';
+import simpleGit from 'simple-git';
+import fs from 'fs';
+import path from 'path';
+import { getEmbeddings, getChatModel, embedTextsWithRetry } from './llmProvider.js';
 import { scanDirectory, parseCodeFile, buildDependencyGraph } from './astParser.js';
 import { analyzeGitArchaeology } from './gitArchaeology.js';
 import * as chromaService from './chromaService.js';
 import { cacheService } from './redisService.js';
+
+/**
+ * Resolve local folder path or auto-clone remote GitHub repository
+ */
+export async function resolveRepoPath(inputPath, onProgress = () => {}) {
+  if (!inputPath) throw new Error('Repository path or URL is required.');
+  const trimmed = inputPath.trim();
+
+  // Check if it's a remote Git URL
+  const isRemote = /^(https?:\/\/|git@)/i.test(trimmed);
+  if (!isRemote) {
+    return path.resolve(trimmed);
+  }
+
+  const repoName = trimmed.split('/').pop().replace(/\.git$/i, '') || 'remote_repo';
+  const cloneBase = path.resolve('./cloned_repos');
+  if (!fs.existsSync(cloneBase)) fs.mkdirSync(cloneBase, { recursive: true });
+  const targetDir = path.join(cloneBase, repoName);
+
+  if (!fs.existsSync(targetDir)) {
+    onProgress({ step: 'cloning', message: `Cloning remote GitHub repository: ${trimmed}...` });
+    const git = simpleGit();
+    try {
+      await git.clone(trimmed, targetDir, ['--depth', '30']);
+      onProgress({ step: 'cloned', message: `Successfully cloned ${repoName}.` });
+    } catch (err) {
+      throw new Error(`Failed to clone remote repository: ${err.message}`);
+    }
+  } else {
+    onProgress({ step: 'cloned', message: `Using cached clone for ${repoName}.` });
+  }
+
+  return targetDir;
+}
 
 /**
  * Ingest a codebase: Scan, AST parse, build graph, analyze git diffs, embed & store
@@ -37,26 +74,11 @@ export async function ingestCodebase(repoPath, onProgress = () => {}) {
   const dependencyGraph = buildDependencyGraph(parsedFiles);
   await cacheService.set(`graph:${repoPath}`, dependencyGraph, 86400);
 
-  // Generate embeddings for code chunks
-  onProgress({ step: 'embedding_code', message: `Generating vector embeddings for ${allCodeChunks.length} code blocks...` });
-  const embeddingsModel = await getEmbeddings();
-
-  const codeTexts = allCodeChunks.map(c => `${c.summary}\n${c.code}`);
-  // Embed in batches
-  const codeEmbeddings = [];
-  const batchSize = 25;
-  for (let i = 0; i < codeTexts.length; i += batchSize) {
-    const batch = codeTexts.slice(i, i + batchSize);
-    const batchEmbeddings = await embeddingsModel.embedDocuments(batch);
-    codeEmbeddings.push(...batchEmbeddings);
-  }
-
-  // Store in ChromaDB
-  onProgress({ step: 'storing_code', message: 'Saving code vectors into ChromaDB...' });
+  // Store in ChromaDB (local ONNX vector model: zero API calls, zero rate limits)
+  onProgress({ step: 'storing_code', message: `Indexing and storing ${allCodeChunks.length} code blocks into vector database...` });
   await chromaService.storeCodeChunks({
     repoPath,
-    chunks: allCodeChunks,
-    embeddings: codeEmbeddings
+    chunks: allCodeChunks
   });
 
   // Analyze Git Archaeology (Diffs to Intent)
@@ -64,14 +86,10 @@ export async function ingestCodebase(repoPath, onProgress = () => {}) {
   const diffs = await analyzeGitArchaeology(repoPath, 15);
 
   if (diffs.length > 0) {
-    onProgress({ step: 'embedding_git', message: `Synthesizing and embedding ${diffs.length} historical Git diffs...` });
-    const diffTexts = diffs.map(d => `${d.intentSummary}\n${d.diffSnippet}`);
-    const diffEmbeddings = await embeddingsModel.embedDocuments(diffTexts);
-
+    onProgress({ step: 'embedding_git', message: `Indexing ${diffs.length} historical Git diffs into vector database...` });
     await chromaService.storeDiffSummaries({
       repoPath,
-      diffs,
-      embeddings: diffEmbeddings
+      diffs
     });
   }
 
@@ -103,14 +121,10 @@ export async function queryCodebase({ repoPath, question, refresh = false }) {
     }
   }
 
-  // 1. Embed user question
-  const embeddingsModel = await getEmbeddings();
-  const queryEmbedding = await embeddingsModel.embedQuery(question);
-
-  // 2. Multi-vector search: Retrieve matching code and git diffs
+  // 1. Multi-vector search: Retrieve matching code and git diffs using local vector model
   const { codeMatches, diffMatches } = await chromaService.searchCodebase({
     repoPath,
-    queryEmbedding,
+    question,
     topK: 5
   });
 
