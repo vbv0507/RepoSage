@@ -14,6 +14,7 @@
     "@langchain/openai": "^0.4.5",
     "@langchain/textsplitters": "^0.1.0",
     "@mermaid-js/mermaid-cli": "^11.17.0",
+    "@repomix/tree-sitter-wasms": "^0.1.17",
     "bullmq": "^6.3.4",
     "chromadb": "^1.10.4",
     "chromadb-default-embed": "^2.14.0",
@@ -23,6 +24,7 @@
     "ioredis": "^5.4.2",
     "nodemailer": "^10.0.1",
     "pdfkit": "^0.20.2",
-    "simple-git": "^3.27.0"
+    "simple-git": "^3.27.0",
+    "web-tree-sitter": "^0.27.0"
   }
 }

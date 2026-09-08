@@ -1,5 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import { createRequire } from 'module';
+import { Parser, Language } from 'web-tree-sitter';
+
+const require = createRequire(import.meta.url);
 
 const IGNORED_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '.next', '.nuxt',
@@ -17,6 +21,69 @@ const CODE_EXTENSIONS = new Set([
   '.py', '.go', '.java', '.cpp', '.c', '.h', '.cs',
   '.rs', '.php', '.rb', '.sql', '.json', '.yaml', '.yml', '.md'
 ]);
+
+// Tree-sitter WASM parsers cache
+let parsers = null;
+let initPromise = null;
+
+/**
+ * Initialize WebAssembly Tree-sitter parsers for JavaScript, TypeScript, TSX, and Python.
+ * Zero native compilation (no node-gyp, no C++ toolchain).
+ */
+export async function initParsers() {
+  if (parsers) return parsers;
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    try {
+      await Parser.init();
+
+      const jsWasm = require.resolve('@repomix/tree-sitter-wasms/out/tree-sitter-javascript.wasm');
+      const tsWasm = require.resolve('@repomix/tree-sitter-wasms/out/tree-sitter-typescript.wasm');
+      const tsxWasm = require.resolve('@repomix/tree-sitter-wasms/out/tree-sitter-tsx.wasm');
+      const pyWasm = require.resolve('@repomix/tree-sitter-wasms/out/tree-sitter-python.wasm');
+
+      const [jsLang, tsLang, tsxLang, pyLang] = await Promise.all([
+        Language.load(jsWasm),
+        Language.load(tsWasm),
+        Language.load(tsxWasm),
+        Language.load(pyWasm)
+      ]);
+
+      const jsParser = new Parser();
+      jsParser.setLanguage(jsLang);
+
+      const tsParser = new Parser();
+      tsParser.setLanguage(tsLang);
+
+      const tsxParser = new Parser();
+      tsxParser.setLanguage(tsxLang);
+
+      const pyParser = new Parser();
+      pyParser.setLanguage(pyLang);
+
+      parsers = {
+        '.js': jsParser,
+        '.mjs': jsParser,
+        '.cjs': jsParser,
+        '.jsx': tsxParser,
+        '.ts': tsParser,
+        '.tsx': tsxParser,
+        '.py': pyParser
+      };
+      return parsers;
+    } catch (err) {
+      console.warn('⚠️ Tree-sitter WASM initialization warning (will use line-based chunking fallback):', err.message);
+      parsers = null;
+      return null;
+    }
+  })();
+
+  return initPromise;
+}
+
+// Top-level await guarantees parsers are loaded as soon as astParser module is imported
+await initParsers();
 
 /**
  * Check if a file should be ignored (e.g. minified or bundled files)
@@ -83,7 +150,7 @@ export function scanDirectory(dirPath, maxFiles = 200) {
 }
 
 /**
- * Parse a source file into logical AST-like code blocks (functions, classes, imports)
+ * Parse a source file into logical AST code blocks (functions, classes, methods, imports)
  */
 export function parseCodeFile(filePath, repoRoot) {
   let content = '';
@@ -99,7 +166,6 @@ export function parseCodeFile(filePath, repoRoot) {
 
   const chunks = [];
   const imports = [];
-  const exports = [];
 
   // Quick check for minified file (any line > 1000 chars)
   const hasMinifiedLines = lines.some(l => l.length > 1000);
@@ -134,17 +200,27 @@ export function parseCodeFile(filePath, repoRoot) {
     }
   }
 
-  // Language-specific block extractor
-  if (['.js', '.jsx', '.ts', '.tsx', '.mjs'].includes(ext)) {
-    extractJavaScriptBlocks(content, lines, relativePath, chunks);
-  } else if (ext === '.py') {
-    extractPythonBlocks(content, lines, relativePath, chunks);
+  // Language-specific block extractor with graceful fallback
+  const parser = parsers ? parsers[ext] : null;
+
+  if (parser) {
+    try {
+      if (['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'].includes(ext)) {
+        extractJavaScriptBlocks(content, relativePath, chunks, parser);
+      } else if (ext === '.py') {
+        extractPythonBlocks(content, relativePath, chunks, parser);
+      }
+    } catch (parseErr) {
+      console.warn(`⚠️ Tree-sitter parse error in ${relativePath}, falling back to generic blocks:`, parseErr.message);
+      chunks.length = 0;
+      extractGenericBlocks(content, lines, relativePath, chunks);
+    }
   } else {
     // Generic fallback: chunk by paragraph / block
     extractGenericBlocks(content, lines, relativePath, chunks);
   }
 
-  // If no functions were detected (e.g. config file, short module), index the file as whole
+  // If no functions/classes were detected (e.g. config file, short module), index the file as whole
   if (chunks.length === 0 && content.trim().length > 0) {
     chunks.push({
       filePath: relativePath,
@@ -165,66 +241,175 @@ export function parseCodeFile(filePath, repoRoot) {
 }
 
 /**
- * Extract functions, classes, and methods from JS/TS code
+ * Extract functions, classes, methods, and arrow functions from JS/TS code using Tree-sitter AST
  */
-function extractJavaScriptBlocks(content, lines, relativePath, chunks) {
-  // Regex patterns for function declarations, arrow functions, and classes
-  const functionRegex = /(?:async\s+)?function\s+([a-zA-Z0-9_$]+)\s*\(([^)]*)\)|(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s+)?\(([^)]*)\)\s*=>|class\s+([a-zA-Z0-9_$]+)/g;
+function extractJavaScriptBlocks(content, relativePath, chunks, parser) {
+  const tree = parser.parse(content);
+  const handledNodeIds = new Set();
 
-  let match;
-  while ((match = functionRegex.exec(content)) !== null) {
-    const name = match[1] || match[3] || match[5];
-    const isClass = Boolean(match[5]);
-    const startIndex = match.index;
+  function traverse(node) {
+    // 1. Function declaration: function foo() {}
+    if (node.type === 'function_declaration') {
+      const name = node.childForFieldName('name')?.text || 'anonymous';
+      const startLine = node.startPosition.row + 1;
+      const endLine = node.endPosition.row + 1;
+      chunks.push({
+        filePath: relativePath,
+        name,
+        type: 'function',
+        startLine,
+        endLine,
+        code: node.text.slice(0, 2000),
+        summary: `Function ${name} in ${relativePath}`
+      });
+      handledNodeIds.add(node.id);
+    }
+    // 2. Class declaration: class Foo {}
+    else if (node.type === 'class_declaration') {
+      const name = node.childForFieldName('name')?.text || 'anonymous';
+      const startLine = node.startPosition.row + 1;
+      const endLine = node.endPosition.row + 1;
+      chunks.push({
+        filePath: relativePath,
+        name,
+        type: 'class',
+        startLine,
+        endLine,
+        code: node.text.slice(0, 2000),
+        summary: `Class ${name} in ${relativePath}`
+      });
+      handledNodeIds.add(node.id);
+    }
+    // 3. Method definition in class or object shorthand: method() {}
+    else if (node.type === 'method_definition') {
+      const name = node.childForFieldName('name')?.text || 'anonymous';
+      const startLine = node.startPosition.row + 1;
+      const endLine = node.endPosition.row + 1;
+      chunks.push({
+        filePath: relativePath,
+        name,
+        type: 'method',
+        startLine,
+        endLine,
+        code: node.text.slice(0, 2000),
+        summary: `Method ${name} in ${relativePath}`
+      });
+      handledNodeIds.add(node.id);
+    }
+    // 4. Variable declarator: const foo = () => {} or const foo = function() {}
+    else if (node.type === 'variable_declarator') {
+      const name = node.childForFieldName('name')?.text;
+      const value = node.childForFieldName('value');
+      if (name && value) {
+        if (value.type === 'arrow_function' || value.type === 'function' || value.type === 'function_expression') {
+          const isArrow = value.type === 'arrow_function';
+          const enclosingDecl = (node.parent?.type === 'lexical_declaration' || node.parent?.type === 'variable_declaration') ? node.parent : null;
+          const targetNode = enclosingDecl || node;
+          const startLine = targetNode.startPosition.row + 1;
+          const endLine = targetNode.endPosition.row + 1;
+          const type = isArrow ? 'arrow_function' : 'function';
+          const typeLabel = isArrow ? 'Arrow function' : 'Function';
 
-    // Find line number
-    const lineNum = content.substring(0, startIndex).split('\n').length;
-    // Extract snippet (up to 40 lines or closing block)
-    const blockLines = lines.slice(lineNum - 1, lineNum + 45);
-    const codeSnippet = blockLines.join('\n').slice(0, 2000);
+          chunks.push({
+            filePath: relativePath,
+            name,
+            type,
+            startLine,
+            endLine,
+            code: targetNode.text.slice(0, 2000),
+            summary: `${typeLabel} ${name} in ${relativePath}`
+          });
+          handledNodeIds.add(value.id);
+        }
+      }
+    }
+    // 5. Object property pair: { foo: () => {} }
+    else if (node.type === 'pair') {
+      const key = node.childForFieldName('key')?.text;
+      const value = node.childForFieldName('value');
+      if (key && value) {
+        if (value.type === 'arrow_function' || value.type === 'function' || value.type === 'function_expression') {
+          const isArrow = value.type === 'arrow_function';
+          const startLine = node.startPosition.row + 1;
+          const endLine = node.endPosition.row + 1;
+          const type = isArrow ? 'arrow_function' : 'method';
+          const typeLabel = isArrow ? 'Arrow function' : 'Method';
 
-    chunks.push({
-      filePath: relativePath,
-      name: name,
-      type: isClass ? 'class' : 'function',
-      startLine: lineNum,
-      endLine: Math.min(lineNum + blockLines.length, lines.length),
-      code: codeSnippet,
-      summary: `${isClass ? 'Class' : 'Function'} ${name} in ${relativePath}`
-    });
+          chunks.push({
+            filePath: relativePath,
+            name: key,
+            type,
+            startLine,
+            endLine,
+            code: node.text.slice(0, 2000),
+            summary: `${typeLabel} ${key} in ${relativePath}`
+          });
+          handledNodeIds.add(value.id);
+        }
+      }
+    }
+
+    // Traverse children, skipping values already handled as named entities
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!handledNodeIds.has(child.id)) {
+        traverse(child);
+      }
+    }
   }
+
+  traverse(tree.rootNode);
 }
 
 /**
- * Extract functions and classes from Python code
+ * Extract functions and classes from Python code using Tree-sitter AST
  */
-function extractPythonBlocks(content, lines, relativePath, chunks) {
-  const pyRegex = /^(?:async\s+)?def\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\):|^class\s+([a-zA-Z0-9_]+)(?:\(([^)]*)\))?:/gm;
+function extractPythonBlocks(content, relativePath, chunks, parser) {
+  const tree = parser.parse(content);
 
-  let match;
-  while ((match = pyRegex.exec(content)) !== null) {
-    const name = match[1] || match[3];
-    const isClass = Boolean(match[3]);
-    const startIndex = match.index;
+  function traverse(node) {
+    if (node.type === 'class_definition') {
+      const name = node.childForFieldName('name')?.text || 'anonymous';
+      const startLine = node.startPosition.row + 1;
+      const endLine = node.endPosition.row + 1;
+      chunks.push({
+        filePath: relativePath,
+        name,
+        type: 'class',
+        startLine,
+        endLine,
+        code: node.text.slice(0, 2000),
+        summary: `Class ${name} in ${relativePath}`
+      });
+    } else if (node.type === 'function_definition') {
+      const name = node.childForFieldName('name')?.text || 'anonymous';
+      const isMethod = node.parent?.type === 'block' && node.parent?.parent?.type === 'class_definition';
+      const type = isMethod ? 'method' : 'function';
+      const typeLabel = isMethod ? 'Method' : 'Function';
+      const startLine = node.startPosition.row + 1;
+      const endLine = node.endPosition.row + 1;
 
-    const lineNum = content.substring(0, startIndex).split('\n').length;
-    const blockLines = lines.slice(lineNum - 1, lineNum + 40);
-    const codeSnippet = blockLines.join('\n').slice(0, 2000);
+      chunks.push({
+        filePath: relativePath,
+        name,
+        type,
+        startLine,
+        endLine,
+        code: node.text.slice(0, 2000),
+        summary: `${typeLabel} ${name} in ${relativePath}`
+      });
+    }
 
-    chunks.push({
-      filePath: relativePath,
-      name: name,
-      type: isClass ? 'class' : 'function',
-      startLine: lineNum,
-      endLine: Math.min(lineNum + blockLines.length, lines.length),
-      code: codeSnippet,
-      summary: `${isClass ? 'Python class' : 'Python function'} ${name} in ${relativePath}`
-    });
+    for (let i = 0; i < node.namedChildCount; i++) {
+      traverse(node.namedChild(i));
+    }
   }
+
+  traverse(tree.rootNode);
 }
 
 /**
- * Generic block chunking
+ * Generic block chunking fallback (50-line blocks)
  */
 function extractGenericBlocks(content, lines, relativePath, chunks) {
   const chunkSize = 50;
