@@ -14,7 +14,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     }
   }, [activeRepo]);
 
-  const startIngestion = () => {
+  const startIngestion = (force = false) => {
     if (!repoPath) return;
 
     setIsIngesting(true);
@@ -22,18 +22,21 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     setStats(null);
     setCurrentStep('Connecting to codebase...');
 
-    const eventSource = new EventSource(`${API_BASE}/api/ingest-stream?path=${encodeURIComponent(repoPath)}`);
+    const forceParam = force ? '&force=true' : '';
+    const eventSource = new EventSource(`${API_BASE}/api/ingest-stream?path=${encodeURIComponent(repoPath)}${forceParam}`);
 
     eventSource.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
 
-        if (data.message) {
+        if (data.step === 'cache_hit') {
+          setCurrentStep(data.message);
+        } else if (data.message) {
           setCurrentStep(data.message);
         } else if (data.step === 'parsing_progress') {
           setCurrentStep(`Parsing files (${data.current}/${data.total})...`);
         } else if (data.step === 'finished') {
-          setCurrentStep('Analysis complete.');
+          setCurrentStep(data.stats?.fromCache ? '⚡ Reused existing vector cache!' : 'Analysis complete.');
           setStats(data.stats);
           eventSource.close();
           setIsIngesting(false);
@@ -95,12 +98,23 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
         />
         <button
           className="btn btn-primary"
-          onClick={startIngestion}
+          onClick={() => startIngestion(false)}
           disabled={isIngesting || !repoPath}
           style={{ flexShrink: 0 }}
         >
           {isIngesting ? 'Analyzing...' : 'Analyze'}
         </button>
+        {stats && (
+          <button
+            className="btn btn-secondary"
+            onClick={() => startIngestion(true)}
+            disabled={isIngesting || !repoPath}
+            title="Force re-compute all embeddings from scratch"
+            style={{ fontSize: '12px', padding: '7px 10px', flexShrink: 0 }}
+          >
+            Re-index
+          </button>
+        )}
       </div>
 
       {isIngesting && (
@@ -117,32 +131,39 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
       )}
 
       {stats && (
-        <div className="stats-grid">
-          <div>
-            <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Files</div>
-            <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>
-              {stats.filesCount}
+        <>
+          <div className="stats-grid">
+            <div>
+              <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Files</div>
+              <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>
+                {stats.filesCount}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>AST Blocks</div>
+              <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>
+                {stats.chunksCount}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Git Diffs</div>
+              <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>
+                {stats.gitDiffsCount}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Dependencies</div>
+              <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>
+                {stats.graphLinksCount}
+              </div>
             </div>
           </div>
-          <div>
-            <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>AST Blocks</div>
-            <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>
-              {stats.chunksCount}
+          {stats.fromCache && (
+            <div style={{ marginTop: '10px', fontSize: '11.5px', color: 'var(--success-color)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span>⚡ Reused existing vector embeddings from ChromaDB (Instant load, zero re-embedding).</span>
             </div>
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Git Diffs</div>
-            <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>
-              {stats.gitDiffsCount}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Dependencies</div>
-            <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>
-              {stats.graphLinksCount}
-            </div>
-          </div>
-        </div>
+          )}
+        </>
       )}
     </div>
   );

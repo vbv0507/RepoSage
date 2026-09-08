@@ -40,6 +40,7 @@ app.get('/api/health', async (req, res) => {
  */
 app.get('/api/ingest-stream', async (req, res) => {
   const inputPath = req.query.path;
+  const force = req.query.force === 'true' || req.query.refresh === 'true';
 
   if (!inputPath) {
     return res.status(400).send('Query parameter "path" is required.');
@@ -60,7 +61,7 @@ app.get('/api/ingest-stream', async (req, res) => {
 
     const stats = await ingestCodebase(resolvedPath, (progress) => {
       sendEvent(progress);
-    });
+    }, force);
 
     sendEvent({ step: 'finished', stats, resolvedPath });
     res.end();
@@ -75,13 +76,13 @@ app.get('/api/ingest-stream', async (req, res) => {
  */
 app.post('/api/ingest', async (req, res) => {
   try {
-    const { repoPath } = req.body;
+    const { repoPath, force } = req.body;
     if (!repoPath) {
       return res.status(400).json({ error: 'repoPath is required' });
     }
 
     const resolvedPath = await resolveRepoPath(repoPath);
-    const stats = await ingestCodebase(resolvedPath);
+    const stats = await ingestCodebase(resolvedPath, () => {}, force === true);
     res.json({ success: true, stats, resolvedPath });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });

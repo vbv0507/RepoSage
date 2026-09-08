@@ -303,3 +303,37 @@ export async function clearRepoVectors(repoPath) {
     return { success: false, error: e.message };
   }
 }
+
+/**
+ * Check if vectors already exist in ChromaDB for a given repoPath
+ */
+export async function getRepoVectorStats(repoPath) {
+  try {
+    const codeColl = await getCodeCollection();
+    const res = await codeColl.get({
+      where: { repoPath: repoPath },
+      limit: 10000,
+      include: ['metadatas']
+    });
+
+    if (!res || !res.ids || res.ids.length === 0) {
+      return { exists: false, count: 0, filesCount: 0 };
+    }
+
+    const uniqueFiles = new Set();
+    if (res.metadatas) {
+      res.metadatas.forEach(m => {
+        if (m && m.filePath) uniqueFiles.add(m.filePath);
+      });
+    }
+
+    return {
+      exists: true,
+      count: res.ids.length,
+      filesCount: uniqueFiles.size
+    };
+  } catch (e) {
+    console.warn(`[ChromaDB] getRepoVectorStats check failed for ${repoPath}:`, e.message);
+    return { exists: false, count: 0, filesCount: 0 };
+  }
+}

@@ -50,9 +50,53 @@ export async function resolveRepoPath(inputPath, onProgress = () => {}) {
 }
 
 /**
+ * Helper to fetch latest git commit hash
+ */
+async function getLatestCommit(repoPath) {
+  try {
+    const git = simpleGit(repoPath);
+    const log = await git.log({ maxCount: 1 });
+    return log?.latest?.hash || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
  * Ingest a codebase: Scan, AST parse, build graph, analyze git diffs, embed & store
  */
-export async function ingestCodebase(repoPath, onProgress = () => {}) {
+export async function ingestCodebase(repoPath, onProgress = () => {}, forceRefresh = false) {
+  const currentCommit = await getLatestCommit(repoPath);
+  const cachedCommit = await cacheService.get(`repoHead:${repoPath}`);
+  const cachedGraph = await cacheService.get(`graph:${repoPath}`);
+
+  // 1. Smart Ingestion Skip: If repository vectors and graph already exist and commit matches
+  if (!forceRefresh) {
+    const existingVectors = await chromaService.getRepoVectorStats(repoPath);
+    const isUpToDate = currentCommit && cachedCommit && currentCommit === cachedCommit;
+
+    if (existingVectors.exists && existingVectors.count > 0 && (isUpToDate || (!currentCommit && cachedGraph))) {
+      console.log(`[Smart Ingestion] ⚡ Codebase already indexed for ${repoPath}. Reusing ${existingVectors.count} existing vectors!`);
+      
+      onProgress({ 
+        step: 'cache_hit', 
+        message: `⚡ Repository is already indexed and up to date! Loaded ${existingVectors.count} existing code vectors.` 
+      });
+
+      onProgress({ step: 'complete', message: 'Ready to query immediately!' });
+
+      return {
+        repoPath,
+        fromCache: true,
+        filesCount: existingVectors.filesCount || cachedGraph?.nodes?.length || 0,
+        chunksCount: existingVectors.count,
+        gitDiffsCount: 0,
+        graphNodesCount: cachedGraph?.nodes?.length || 0,
+        graphLinksCount: cachedGraph?.links?.length || 0
+      };
+    }
+  }
+
   // Clear cached queries so fresh and updated answers are generated
   await cacheService.clearQueries();
 
@@ -99,6 +143,10 @@ export async function ingestCodebase(repoPath, onProgress = () => {}) {
       repoPath,
       diffs
     });
+  }
+
+  if (currentCommit) {
+    await cacheService.set(`repoHead:${repoPath}`, currentCommit, 86400 * 30);
   }
 
   onProgress({ step: 'complete', message: 'Repository ingestion complete!' });
