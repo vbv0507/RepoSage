@@ -35,7 +35,15 @@ export async function resolveRepoPath(inputPath, onProgress = () => {}) {
       throw new Error(`Failed to clone remote repository: ${err.message}`);
     }
   } else {
-    onProgress({ step: 'cloned', message: `Using cached clone for ${repoName}.` });
+    onProgress({ step: 'cloning', message: `Syncing repository: pulling latest commits for ${repoName}...` });
+    try {
+      const git = simpleGit(targetDir);
+      await git.pull();
+      onProgress({ step: 'cloned', message: `Successfully updated ${repoName} to latest commit.` });
+    } catch (err) {
+      console.warn(`[Git] Pull failed for ${repoName}, continuing with existing clone:`, err.message);
+      onProgress({ step: 'cloned', message: `Using existing clone for ${repoName}.` });
+    }
   }
 
   return targetDir;

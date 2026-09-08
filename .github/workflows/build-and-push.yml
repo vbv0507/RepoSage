@@ -41,3 +41,26 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/reposage-frontend:latest
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Auto-Deploy to Azure Container Apps
+        run: |
+          az extension add --name containerapp --upgrade --yes
+          
+          echo "🚀 Deploying Backend to Azure Container Apps..."
+          az containerapp update \
+            --name reposage-backend \
+            --resource-group reposage-rg \
+            --image ghcr.io/${{ github.repository_owner }}/reposage-backend:latest
+          
+          echo "🚀 Deploying Frontend to Azure Container Apps..."
+          az containerapp update \
+            --name reposage-frontend \
+            --resource-group reposage-rg \
+            --image ghcr.io/${{ github.repository_owner }}/reposage-frontend:latest
+          
+          echo "✅ Both containers successfully deployed to Azure!"
