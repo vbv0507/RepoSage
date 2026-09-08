@@ -219,9 +219,9 @@ export default function CodeTutorial({ activeRepo }) {
   return (
     <div style={{ maxWidth: '1180px', margin: '0 auto 32px auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
       {/* Control Bar */}
-      <div className="card" style={{ padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="card" style={{ padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <BookOpen size={18} style={{ color: 'var(--text-primary)' }} />
+          <BookOpen size={18} style={{ color: 'var(--text-primary)', flexShrink: 0 }} />
           <div>
             <div style={{ fontSize: '14px', fontWeight: '600', color: 'var(--text-primary)' }}>
               Architecture Blueprint & Engineering Book
@@ -232,7 +232,7 @@ export default function CodeTutorial({ activeRepo }) {
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
           <button
             className="btn btn-secondary"
             onClick={() => setShowEmailModal(true)}
@@ -295,7 +295,7 @@ export default function CodeTutorial({ activeRepo }) {
 
       {/* Main Reader View */}
       {tutorial && tutorial.chapters && tutorial.chapters.length > 0 ? (
-        <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: '16px', alignItems: 'start' }}>
+        <div className="grid-tutorial">
           {/* Left Sidebar Table of Contents */}
           <div className="card" style={{ padding: '16px 12px' }}>
             <div style={{ fontSize: '11.5px', fontWeight: '600', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', padding: '0 8px 10px 8px' }}>

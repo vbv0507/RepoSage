@@ -6,25 +6,18 @@ export default function Header({ health, activeRepo }) {
   const llmConfigured = health?.services?.llm?.configured;
 
   return (
-    <header style={{
-      borderBottom: '1px solid var(--border-color)',
-      backgroundColor: '#0c0c0e',
-      padding: '12px 24px',
-      display: 'flex',
-      justifyContent: 'space-between',
-      alignItems: 'center'
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-        <span style={{ fontSize: '15px', fontWeight: '600', color: '#ffffff', letterSpacing: '-0.01em' }}>
+    <header className="app-header">
+      <div className="header-brand">
+        <span style={{ fontSize: '15px', fontWeight: '600', color: '#ffffff', letterSpacing: '-0.01em', whiteSpace: 'nowrap' }}>
           RepoSage
         </span>
         <span style={{ color: 'var(--border-color)', userSelect: 'none' }}>/</span>
-        <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
-          Codebase Architecture Copilot
+        <span style={{ fontSize: '13px', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          Architecture Intelligence
         </span>
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+      <div className="header-status-group">
         {activeRepo && (
           <span style={{
             fontSize: '12px',
@@ -33,7 +26,11 @@ export default function Header({ health, activeRepo }) {
             backgroundColor: '#18181b',
             padding: '3px 8px',
             borderRadius: '4px',
-            border: '1px solid var(--border-color)'
+            border: '1px solid var(--border-color)',
+            maxWidth: '160px',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap'
           }}>
             {activeRepo.split(/[\/\\]/).pop()}
           </span>
@@ -42,19 +39,19 @@ export default function Header({ health, activeRepo }) {
         {/* ChromaDB Status */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--text-secondary)' }}>
           <span className={`status-dot ${chromaConnected ? 'online' : 'offline'}`} />
-          <span>{chromaConnected ? 'ChromaDB' : 'Chroma Offline'}</span>
+          <span style={{ whiteSpace: 'nowrap' }}>{chromaConnected ? 'ChromaDB' : 'Chroma Offline'}</span>
         </div>
 
         {/* Redis Status */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--text-secondary)' }}>
           <span className={`status-dot ${redisConnected ? 'online' : 'warning'}`} />
-          <span>{redisConnected ? 'Redis' : 'Cache (Memory)'}</span>
+          <span style={{ whiteSpace: 'nowrap' }}>{redisConnected ? 'Redis' : 'Cache (Memory)'}</span>
         </div>
 
         {/* LLM Status */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--text-secondary)' }}>
           <span className={`status-dot ${llmConfigured ? 'online' : 'warning'}`} />
-          <span>{health?.services?.llm?.provider === 'gemini' ? 'Gemini 2.5' : 'OpenAI'}</span>
+          <span style={{ whiteSpace: 'nowrap' }}>{health?.services?.llm?.provider === 'gemini' ? 'Gemini 2.5' : 'OpenAI'}</span>
         </div>
       </div>
     </header>

@@ -38,24 +38,17 @@ export default function App() {
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
       <Header health={health} activeRepo={activeRepo} />
 
-      <main style={{ flex: 1, padding: '0 16px' }}>
+      <main className="app-container" style={{ flex: 1, padding: '0 16px' }}>
         <RepoIngestion
           activeRepo={activeRepo}
           onIngestionComplete={handleIngestionComplete}
         />
 
-        {/* Minimal Tab Switcher */}
-        <div style={{
-          maxWidth: '1180px',
-          margin: '0 auto 16px auto',
-          display: 'flex',
-          gap: '4px',
-          borderBottom: '1px solid var(--border-color)',
-          paddingBottom: '8px'
-        }}>
+        {/* Responsive Tab Switcher */}
+        <div className="tab-bar-container">
           <button
             onClick={() => setActiveTab('chat')}
-            className="btn"
+            className={`btn tab-btn`}
             style={{
               backgroundColor: activeTab === 'chat' ? '#27272a' : 'transparent',
               color: activeTab === 'chat' ? 'var(--text-primary)' : 'var(--text-muted)',
@@ -67,7 +60,7 @@ export default function App() {
 
           <button
             onClick={() => setActiveTab('graph')}
-            className="btn"
+            className={`btn tab-btn`}
             style={{
               backgroundColor: activeTab === 'graph' ? '#27272a' : 'transparent',
               color: activeTab === 'graph' ? 'var(--text-primary)' : 'var(--text-muted)',
@@ -79,7 +72,7 @@ export default function App() {
 
           <button
             onClick={() => setActiveTab('tutorial')}
-            className="btn"
+            className={`btn tab-btn`}
             style={{
               backgroundColor: activeTab === 'tutorial' ? '#27272a' : 'transparent',
               color: activeTab === 'tutorial' ? 'var(--text-primary)' : 'var(--text-muted)',

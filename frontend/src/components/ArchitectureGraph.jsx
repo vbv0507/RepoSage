@@ -42,8 +42,8 @@ export default function ArchitectureGraph({ activeRepo }) {
     : [];
 
   return (
-    <div className="card" style={{ maxWidth: '1100px', margin: '0 auto 24px auto', padding: '20px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+    <div className="card" style={{ maxWidth: '1180px', margin: '0 auto 24px auto', padding: '16px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px', flexWrap: 'wrap', gap: '10px' }}>
         <div>
           <span style={{ fontSize: '15px', fontWeight: '600' }}>Module Dependencies</span>
           <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
@@ -52,7 +52,7 @@ export default function ArchitectureGraph({ activeRepo }) {
         </div>
 
         {/* Filter buttons */}
-        <div style={{ display: 'flex', gap: '6px' }}>
+        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
           {['all', 'api', 'service', 'data', 'utility'].map(cat => (
             <button
               key={cat}
@@ -81,7 +81,7 @@ export default function ArchitectureGraph({ activeRepo }) {
           No dependencies found yet. Analyze a codebase to inspect module relations.
         </div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: '16px', minHeight: '320px' }}>
+        <div className="grid-dependencies">
           {/* File List Grid */}
           <div style={{
             backgroundColor: '#18181b',

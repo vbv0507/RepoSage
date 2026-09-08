@@ -119,3 +119,259 @@ code, pre {
 ::-webkit-scrollbar-thumb:hover {
   background: #3f3f46;
 }
+
+/* ==========================================================================
+   Responsive Design System (Mobile, Tablet, Laptop, Ultrawide)
+   ========================================================================== */
+
+.app-container {
+  max-width: 1200px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0 16px;
+}
+
+/* Header Responsive Layout */
+.app-header {
+  border-bottom: 1px solid var(--border-color);
+  background-color: #0c0c0e;
+  padding: 12px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  backdrop-filter: blur(8px);
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.header-status-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* Ingestion Card Responsive */
+.ingestion-card {
+  padding: 20px;
+  margin: 16px auto;
+  max-width: 1180px;
+  width: 100%;
+}
+
+.ingestion-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.ingestion-input-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.ingestion-input {
+  flex: 1;
+  min-width: 0;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 9px 12px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: monospace;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.ingestion-input:focus {
+  border-color: #52525b;
+}
+
+/* Responsive Tab Bar */
+.tab-bar-container {
+  max-width: 1180px;
+  width: 100%;
+  margin: 0 auto 16px auto;
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 8px;
+  overflow-x: auto;
+  scrollbar-width: none; /* Firefox */
+  -webkit-overflow-scrolling: touch;
+}
+
+.tab-bar-container::-webkit-scrollbar {
+  display: none; /* Chrome, Safari, Edge */
+}
+
+.tab-btn {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Chat Layout Responsive */
+.chat-container {
+  max-width: 1180px;
+  width: 100%;
+  margin: 0 auto 24px auto;
+  display: flex;
+  flex-direction: column;
+  height: calc(100dvh - 240px);
+  min-height: 520px;
+}
+
+.chat-prompts-bar {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.chat-prompts-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.chat-prompt-pill {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Dependencies Grid Responsive */
+.grid-dependencies {
+  display: grid;
+  grid-template-columns: 1fr 340px;
+  gap: 16px;
+  min-height: 320px;
+}
+
+/* Tutorial Layout Responsive */
+.grid-tutorial {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+/* Mermaid SVG Responsive Wrapper */
+.mermaid-diagram-container {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px;
+  background-color: #0c0c0e;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  margin: 14px 0;
+}
+
+.mermaid-diagram-container svg {
+  max-width: 100%;
+  height: auto !important;
+  display: block;
+  margin: 0 auto;
+}
+
+/* ==========================================================================
+   Breakpoints
+   ========================================================================== */
+
+/* Tablets & Small Laptops (<= 1024px) */
+@media (max-width: 1024px) {
+  .grid-tutorial {
+    grid-template-columns: 240px 1fr;
+    gap: 12px;
+  }
+
+  .grid-dependencies {
+    grid-template-columns: 1fr 300px;
+    gap: 12px;
+  }
+}
+
+/* Tablets (<= 850px) */
+@media (max-width: 850px) {
+  .grid-dependencies {
+    grid-template-columns: 1fr;
+  }
+
+  .grid-tutorial {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-container {
+    height: calc(100dvh - 280px);
+    min-height: 480px;
+  }
+}
+
+/* Mobile Devices (<= 640px) */
+@media (max-width: 640px) {
+  .app-header {
+    padding: 10px 14px;
+  }
+
+  .header-brand {
+    font-size: 13px;
+  }
+
+  .header-status-group {
+    gap: 8px;
+    font-size: 11px;
+    width: 100%;
+    justify-content: flex-start;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+  }
+
+  .ingestion-card {
+    padding: 14px;
+    margin: 10px auto;
+  }
+
+  .ingestion-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .ingestion-input-row {
+    flex-direction: column;
+  }
+
+  .ingestion-input-row .btn {
+    width: 100%;
+    padding: 10px;
+  }
+
+  .chat-container {
+    height: calc(100dvh - 260px);
+    min-height: 420px;
+    margin-bottom: 16px;
+  }
+
+  .btn {
+    padding: 7px 12px;
+    font-size: 12px;
+  }
+}
+

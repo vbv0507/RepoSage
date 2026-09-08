@@ -49,8 +49,8 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
   };
 
   return (
-    <div className="card" style={{ padding: '20px', margin: '20px auto', maxWidth: '1100px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '14px' }}>
+    <div className="card ingestion-card">
+      <div className="ingestion-header">
         <div>
           <h2 style={{ fontSize: '15px', fontWeight: '600', color: 'var(--text-primary)' }}>
             Codebase Ingestion
@@ -60,13 +60,13 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
           </p>
         </div>
 
-        <div style={{ display: 'flex', gap: '6px' }}>
+        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
           <button
             className="btn btn-secondary"
-            onClick={() => setRepoPath('d:/new/ai_agent/RAG/project-1-chrome-extension')}
+            onClick={() => setRepoPath('https://github.com/vbv0507/RepoSage')}
             style={{ fontSize: '11.5px', padding: '3px 8px' }}
           >
-            Current Repo
+            RepoSage
           </button>
           <button
             className="btn btn-secondary"
@@ -78,29 +78,20 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
         </div>
       </div>
 
-      <div style={{ display: 'flex', gap: '8px' }}>
+      <div className="ingestion-input-row">
         <input
           type="text"
+          className="ingestion-input"
           value={repoPath}
           onChange={(e) => setRepoPath(e.target.value)}
-          placeholder="e.g. https://github.com/expressjs/express or D:/projects/my-app"
+          placeholder="e.g. https://github.com/vbv0507/RepoSage or https://github.com/expressjs/express"
           disabled={isIngesting}
-          style={{
-            flex: 1,
-            backgroundColor: 'var(--bg-input)',
-            border: '1px solid var(--border-color)',
-            borderRadius: '6px',
-            padding: '9px 12px',
-            color: 'var(--text-primary)',
-            fontSize: '13px',
-            fontFamily: 'monospace',
-            outline: 'none'
-          }}
         />
         <button
           className="btn btn-primary"
           onClick={startIngestion}
           disabled={isIngesting || !repoPath}
+          style={{ flexShrink: 0 }}
         >
           {isIngesting ? 'Analyzing...' : 'Analyze'}
         </button>

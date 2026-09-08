@@ -103,28 +103,22 @@ export default function ChatCopilot({ activeRepo }) {
   };
 
   return (
-    <div className="card" style={{
-      maxWidth: '1100px',
-      margin: '0 auto 24px auto',
-      height: '620px',
-      display: 'flex',
-      flexDirection: 'column'
-    }}>
+    <div className="card chat-container">
       {/* Header & Quick Prompts */}
-      <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--border-color)' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+      <div style={{ borderBottom: '1px solid var(--border-color)' }}>
+        <div style={{ padding: '12px 16px 8px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '6px' }}>
           <span style={{ fontSize: '14px', fontWeight: '600' }}>Copilot Chat</span>
           <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>AST + Git Archaeology Grounded</span>
         </div>
 
-        <div style={{ display: 'flex', gap: '6px', overflowX: 'auto', paddingBottom: '2px' }}>
+        <div className="chat-prompts-bar">
           {suggestedPrompts.map((p, i) => (
             <button
               key={i}
               onClick={() => handleSend(p)}
               disabled={loading}
-              className="btn btn-secondary"
-              style={{ fontSize: '11.5px', padding: '4px 10px', whiteSpace: 'nowrap' }}
+              className="btn btn-secondary chat-prompt-pill"
+              style={{ fontSize: '11.5px', padding: '4px 10px' }}
             >
               {p}
             </button>
