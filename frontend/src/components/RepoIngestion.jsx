@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { API_BASE } from '../config';
 
 export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
   const [repoPath, setRepoPath] = useState(activeRepo || 'd:/new/ai_agent/RAG/project-1-chrome-extension');
@@ -15,7 +16,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     setStats(null);
     setCurrentStep('Connecting to codebase...');
 
-    const eventSource = new EventSource(`/api/ingest-stream?path=${encodeURIComponent(repoPath)}`);
+    const eventSource = new EventSource(`${API_BASE}/api/ingest-stream?path=${encodeURIComponent(repoPath)}`);
 
     eventSource.onmessage = (event) => {
       try {

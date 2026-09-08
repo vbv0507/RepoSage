@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import mermaid from 'mermaid';
 import { BookOpen, Download, RefreshCw, CheckCircle2, ChevronRight, ChevronLeft, Sparkles, AlertCircle, Mail, Send, ExternalLink, X, Copy, Check } from 'lucide-react';
 import { cleanMermaidCode } from '../utils/mermaidCleaner';
+import { API_BASE } from '../config';
 
 // Initialize mermaid with suppressErrorRendering: true to prevent error bombs
 mermaid.initialize({
@@ -68,7 +69,7 @@ export default function CodeTutorial({ activeRepo }) {
     setEmailJobStatus({ state: 'waiting', progress: 5, message: 'Submitting job to BullMQ distributed queue...' });
 
     try {
-      const res = await fetch('/api/tutorial/email', {
+      const res = await fetch(`${API_BASE}/api/tutorial/email`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repoPath: activeRepo, email: emailInput })
@@ -91,7 +92,7 @@ export default function CodeTutorial({ activeRepo }) {
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = setInterval(async () => {
         try {
-          const pollRes = await fetch(`/api/tutorial/email/status/${data.jobId}`);
+          const pollRes = await fetch(`${API_BASE}/api/tutorial/email/status/${data.jobId}`);
           if (pollRes.ok) {
             const status = await pollRes.json();
             setEmailJobStatus(status);
@@ -122,7 +123,7 @@ export default function CodeTutorial({ activeRepo }) {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/tutorial?path=${encodeURIComponent(repo)}`);
+      const res = await fetch(`${API_BASE}/api/tutorial?path=${encodeURIComponent(repo)}`);
       if (res.ok) {
         const data = await res.json();
         setTutorial(data);
@@ -147,7 +148,7 @@ export default function CodeTutorial({ activeRepo }) {
 
     const incomingChapters = [];
     const refreshParam = forceRefresh ? '&refresh=true' : '';
-    const eventSource = new EventSource(`/api/tutorial-stream?path=${encodeURIComponent(activeRepo)}${refreshParam}`);
+    const eventSource = new EventSource(`${API_BASE}/api/tutorial-stream?path=${encodeURIComponent(activeRepo)}${refreshParam}`);
 
     eventSource.onmessage = (event) => {
       try {
@@ -191,7 +192,7 @@ export default function CodeTutorial({ activeRepo }) {
     if (!tutorial) return;
 
     try {
-      const res = await fetch('/api/tutorial/export', {
+      const res = await fetch(`${API_BASE}/api/tutorial/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repoPath: activeRepo })

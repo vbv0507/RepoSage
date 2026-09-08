@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { API_BASE } from '../config';
 
 export default function ArchitectureGraph({ activeRepo }) {
   const [graphData, setGraphData] = useState({ nodes: [], links: [] });
@@ -14,7 +15,7 @@ export default function ArchitectureGraph({ activeRepo }) {
   const fetchGraph = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/graph?path=${encodeURIComponent(activeRepo)}`);
+      const res = await fetch(`${API_BASE}/api/graph?path=${encodeURIComponent(activeRepo)}`);
       if (res.ok) {
         const data = await res.json();
         setGraphData(data);

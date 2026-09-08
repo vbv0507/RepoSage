@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { API_BASE } from '../config';
 
 export default function ChatCopilot({ activeRepo }) {
   const [messages, setMessages] = useState([
@@ -29,7 +30,7 @@ export default function ChatCopilot({ activeRepo }) {
     setLoading(true);
 
     try {
-      const res = await fetch('/api/chat', {
+      const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

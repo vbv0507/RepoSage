@@ -4,6 +4,7 @@ import RepoIngestion from './components/RepoIngestion';
 import ArchitectureGraph from './components/ArchitectureGraph';
 import ChatCopilot from './components/ChatCopilot';
 import CodeTutorial from './components/CodeTutorial';
+import { API_BASE } from './config';
 
 export default function App() {
   const [health, setHealth] = useState(null);
@@ -18,7 +19,7 @@ export default function App() {
 
   const fetchHealth = async () => {
     try {
-      const res = await fetch('/api/health');
+      const res = await fetch(`${API_BASE}/api/health`);
       if (res.ok) {
         const data = await res.json();
         setHealth(data);
