@@ -1,4 +1,4 @@
-name: Build & Push Backend Container
+name: Build & Push Containers
 
 on:
   push:
@@ -33,3 +33,11 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/reposage-backend:latest
+
+      - name: Build and Push Frontend Image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/reposage-frontend:latest
