@@ -1,12 +1,18 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { API_BASE } from '../config';
 
 export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
-  const [repoPath, setRepoPath] = useState(activeRepo || 'd:/new/ai_agent/RAG/project-1-chrome-extension');
+  const [repoPath, setRepoPath] = useState(activeRepo || 'https://github.com/vbv0507/RepoSage');
   const [isIngesting, setIsIngesting] = useState(false);
   const [currentStep, setCurrentStep] = useState('');
   const [stats, setStats] = useState(null);
   const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (activeRepo) {
+      setRepoPath(activeRepo);
+    }
+  }, [activeRepo]);
 
   const startIngestion = () => {
     if (!repoPath) return;
@@ -111,14 +117,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
       )}
 
       {stats && (
-        <div style={{
-          marginTop: '16px',
-          paddingTop: '16px',
-          borderTop: '1px solid var(--border-color)',
-          display: 'grid',
-          gridTemplateColumns: 'repeat(4, 1fr)',
-          gap: '12px'
-        }}>
+        <div className="stats-grid">
           <div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Files</div>
             <div style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px' }}>

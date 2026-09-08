@@ -8,7 +8,7 @@ import { API_BASE } from './config';
 
 export default function App() {
   const [health, setHealth] = useState(null);
-  const [activeRepo, setActiveRepo] = useState('d:/new/ai_agent/RAG/project-1-chrome-extension');
+  const [activeRepo, setActiveRepo] = useState('https://github.com/vbv0507/RepoSage');
   const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'graph' | 'tutorial'
 
   useEffect(() => {

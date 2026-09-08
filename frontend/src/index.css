@@ -124,49 +124,68 @@ code, pre {
    Responsive Design System (Mobile, Tablet, Laptop, Ultrawide)
    ========================================================================== */
 
+html, body, #root {
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
 .app-container {
   max-width: 1200px;
   width: 100%;
   margin: 0 auto;
   padding: 0 16px;
+  box-sizing: border-box;
+  overflow-x: hidden;
 }
 
 /* Header Responsive Layout */
 .app-header {
   border-bottom: 1px solid var(--border-color);
   background-color: #0c0c0e;
-  padding: 12px 24px;
+  padding: 12px 20px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 10px;
   position: sticky;
   top: 0;
   z-index: 50;
   backdrop-filter: blur(8px);
+  box-sizing: border-box;
 }
 
 .header-brand {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
+  flex-shrink: 0;
 }
 
 .header-status-group {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 10px;
+}
+
+.header-status-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 /* Ingestion Card Responsive */
 .ingestion-card {
-  padding: 20px;
+  padding: 18px 20px;
   margin: 16px auto;
   max-width: 1180px;
   width: 100%;
+  box-sizing: border-box;
 }
 
 .ingestion-header {
@@ -196,10 +215,21 @@ code, pre {
   font-family: monospace;
   outline: none;
   transition: border-color 0.15s ease;
+  box-sizing: border-box;
 }
 
 .ingestion-input:focus {
   border-color: #52525b;
+}
+
+/* Responsive Stats Grid */
+.stats-grid {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
 }
 
 /* Responsive Tab Bar */
@@ -233,7 +263,8 @@ code, pre {
   display: flex;
   flex-direction: column;
   height: calc(100dvh - 240px);
-  min-height: 520px;
+  min-height: 500px;
+  box-sizing: border-box;
 }
 
 .chat-prompts-bar {
@@ -272,6 +303,11 @@ code, pre {
   align-items: start;
 }
 
+.tutorial-reader-pane {
+  padding: 28px 32px;
+  box-sizing: border-box;
+}
+
 /* Mermaid SVG Responsive Wrapper */
 .mermaid-diagram-container {
   width: 100%;
@@ -283,6 +319,7 @@ code, pre {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   margin: 14px 0;
+  box-sizing: border-box;
 }
 
 .mermaid-diagram-container svg {
@@ -299,74 +336,99 @@ code, pre {
 /* Tablets & Small Laptops (<= 1024px) */
 @media (max-width: 1024px) {
   .grid-tutorial {
-    grid-template-columns: 240px 1fr;
+    grid-template-columns: 1fr;
     gap: 12px;
   }
 
   .grid-dependencies {
-    grid-template-columns: 1fr 300px;
+    grid-template-columns: 1fr;
     gap: 12px;
   }
-}
 
-/* Tablets (<= 850px) */
-@media (max-width: 850px) {
-  .grid-dependencies {
-    grid-template-columns: 1fr;
-  }
-
-  .grid-tutorial {
-    grid-template-columns: 1fr;
-  }
-
-  .chat-container {
-    height: calc(100dvh - 280px);
-    min-height: 480px;
+  .tutorial-reader-pane {
+    padding: 20px 24px;
   }
 }
 
 /* Mobile Devices (<= 640px) */
 @media (max-width: 640px) {
+  .app-container {
+    padding: 0 8px;
+  }
+
   .app-header {
-    padding: 10px 14px;
+    padding: 10px 12px;
+    gap: 8px;
   }
 
   .header-brand {
-    font-size: 13px;
+    font-size: 14px;
+  }
+
+  .header-slash, .header-subtitle {
+    display: none;
   }
 
   .header-status-group {
-    gap: 8px;
-    font-size: 11px;
     width: 100%;
     justify-content: flex-start;
-    padding-top: 6px;
+    gap: 8px;
+    padding-top: 4px;
     border-top: 1px solid rgba(255, 255, 255, 0.05);
   }
 
+  .header-status-item {
+    font-size: 11px;
+    gap: 4px;
+  }
+
+  .header-repo-pill {
+    max-width: 100px !important;
+    font-size: 10.5px !important;
+    padding: 2px 6px !important;
+  }
+
   .ingestion-card {
-    padding: 14px;
+    padding: 14px 12px;
     margin: 10px auto;
   }
 
   .ingestion-header {
     flex-direction: column;
     align-items: stretch;
+    gap: 10px;
   }
 
   .ingestion-input-row {
     flex-direction: column;
+    gap: 8px;
   }
 
   .ingestion-input-row .btn {
     width: 100%;
-    padding: 10px;
+    height: 40px;
+    font-size: 13.5px;
+  }
+
+  .stats-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
   }
 
   .chat-container {
-    height: calc(100dvh - 260px);
+    height: calc(100dvh - 200px);
     min-height: 420px;
-    margin-bottom: 16px;
+    margin-bottom: 14px;
+  }
+
+  .tutorial-reader-pane {
+    padding: 16px 12px;
+  }
+
+  .tab-bar-container {
+    padding-left: 2px;
+    padding-right: 2px;
+    margin-bottom: 12px;
   }
 
   .btn {
@@ -374,4 +436,20 @@ code, pre {
     font-size: 12px;
   }
 }
+
+/* Small Mobile Devices (<= 420px) */
+@media (max-width: 420px) {
+  .header-status-group {
+    gap: 6px;
+  }
+
+  .header-status-item span:last-child {
+    font-size: 10.5px;
+  }
+
+  .ingestion-card {
+    padding: 12px 10px;
+  }
+}
+
 

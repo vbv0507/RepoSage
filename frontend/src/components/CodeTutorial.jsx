@@ -334,7 +334,7 @@ export default function CodeTutorial({ activeRepo }) {
           </div>
 
           {/* Reading Pane */}
-          <div className="card" style={{ padding: '28px 32px', minHeight: '650px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+          <div className="card tutorial-reader-pane" style={{ minHeight: '650px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
             <div>
               {activeChapter && (
                 <>
