@@ -1,19 +1,19 @@
-FROM node:22-slim
-
-# Install git for Git Archaeology features
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --production --legacy-peer-deps
+# Install system dependencies (git for GitPython and repository cloning)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+ENV PORT=5000
 EXPOSE 5000
 
-ENV PORT=5000
-ENV REDIS_URL=redis://redis:6379
-ENV CHROMA_URL=http://chromadb:8000
-
-CMD ["node", "server.js"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000"]

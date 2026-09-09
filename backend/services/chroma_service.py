@@ -1,0 +1,299 @@
+import os
+import math
+import logging
+import requests
+from typing import List, Dict, Any, Optional
+import chromadb
+from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+
+logger = logging.getLogger("chroma_service")
+
+CHROMA_URL = os.getenv("CHROMA_URL", "http://localhost:8000")
+
+class ResilientEmbeddingFunction(EmbeddingFunction):
+    """
+    Resilient multi-tier embedding function:
+    1. Google Gemini Embeddings (models/text-embedding-004) if GEMINI_API_KEY is provided
+    2. Deterministic normalized hash vector (384 dims, zero crashes)
+    """
+    def __init__(self):
+        self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+
+    def __call__(self, input: Documents) -> Embeddings:
+        # 1. Try Gemini Cloud Embeddings
+        if self.api_key:
+            try:
+                requests_data = [
+                    {
+                        "model": "models/text-embedding-004",
+                        "content": {"parts": [{"text": (text or "")[:2048]}]}
+                    }
+                    for text in input
+                ]
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={self.api_key}"
+                resp = requests.post(url, json={"requests": requests_data}, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "embeddings" in data and len(data["embeddings"]) > 0:
+                        return [e["values"] for e in data["embeddings"]]
+            except Exception as e:
+                logger.warning(f"[ChromaDB] Gemini embedding call failed, falling back to local vector: {e}")
+
+        # 2. Resilient Normalized Hash Vector (384 dimensions)
+        results = []
+        for text in input:
+            vec = [0.0] * 384
+            s = text or ""
+            for i, ch in enumerate(s):
+                vec[i % 384] += ord(ch) * 0.001
+            mag = math.sqrt(sum(v * v for v in vec)) or 1.0
+            results.append([v / mag for v in vec])
+        return results
+
+_client = None
+_embedding_fn = None
+_code_collection = None
+_diffs_collection = None
+
+def get_embedding_function() -> ResilientEmbeddingFunction:
+    global _embedding_fn
+    if _embedding_fn is None:
+        _embedding_fn = ResilientEmbeddingFunction()
+    return _embedding_fn
+
+def get_chroma_client():
+    global _client
+    if _client is not None:
+        return _client
+
+    # Try connecting to remote/local HTTP server
+    try:
+        if CHROMA_URL.startswith("http"):
+            parts = CHROMA_URL.replace("http://", "").replace("https://", "").split(":")
+            host = parts[0]
+            port = int(parts[1]) if len(parts) > 1 else 8000
+            client = chromadb.HttpClient(host=host, port=port)
+            client.heartbeat()
+            _client = client
+            return _client
+    except Exception as e:
+        logger.info(f"[ChromaDB] HTTP ChromaDB not reachable at {CHROMA_URL}: {e}. Initializing persistent local DB.")
+
+    # Fallback to local persistent storage
+    persist_dir = os.path.abspath("./chroma_data")
+    os.makedirs(persist_dir, exist_ok=True)
+    _client = chromadb.PersistentClient(path=persist_dir)
+    return _client
+
+def check_chroma_connection() -> dict:
+    try:
+        c = get_chroma_client()
+        hb = c.heartbeat()
+        return {"connected": True, "heartbeat": hb, "embeddingType": "Gemini-004 + Resilient Hash"}
+    except Exception as e:
+        return {"connected": False, "error": str(e)}
+
+def _get_or_init_collection(name: str):
+    c = get_chroma_client()
+    ef = get_embedding_function()
+    try:
+        return c.get_or_create_collection(
+            name=name,
+            embedding_function=ef,
+            metadata={"hnsw:space": "cosine"}
+        )
+    except Exception as e:
+        if "dimension" in str(e).lower():
+            logger.info(f"[ChromaDB] Resetting collection {name} for dimension match...")
+            try:
+                c.delete_collection(name=name)
+            except Exception:
+                pass
+            return c.create_collection(
+                name=name,
+                embedding_function=ef,
+                metadata={"hnsw:space": "cosine"}
+            )
+        raise e
+
+def get_code_collection():
+    global _code_collection
+    if _code_collection is None:
+        _code_collection = _get_or_init_collection("reposage_code")
+    return _code_collection
+
+def get_diffs_collection():
+    global _diffs_collection
+    if _diffs_collection is None:
+        _diffs_collection = _get_or_init_collection("reposage_diffs")
+    return _diffs_collection
+
+async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]]) -> dict:
+    coll = get_code_collection()
+    
+    # Delete prior vectors for this repo
+    try:
+        coll.delete(where={"repoPath": repo_path})
+    except Exception:
+        pass
+
+    ids = []
+    documents = []
+    metadatas = []
+
+    for i, chunk in enumerate(chunks):
+        file_path = chunk.get("filePath", "")
+        start_line = chunk.get("startLine", 1)
+        uid = f"code_{abs(hash(f'{file_path}:{start_line}')) % 100000000}_{i}"
+        ids.append(uid)
+        documents.append((chunk.get("code") or "")[:2000])
+        metadatas.append({
+            "repoPath": repo_path,
+            "filePath": file_path,
+            "name": chunk.get("name") or "unnamed",
+            "type": chunk.get("type") or "code",
+            "startLine": int(start_line),
+            "endLine": int(chunk.get("endLine", 1)),
+            "summary": (chunk.get("summary") or "")[:400]
+        })
+
+    # Batch add
+    BATCH_SIZE = 25
+    for i in range(0, len(ids), BATCH_SIZE):
+        b_ids = ids[i:i + BATCH_SIZE]
+        b_docs = documents[i:i + BATCH_SIZE]
+        b_metas = metadatas[i:i + BATCH_SIZE]
+        coll.add(ids=b_ids, documents=b_docs, metadatas=b_metas)
+
+    return {"storedCount": len(chunks)}
+
+async def store_diff_summaries(repo_path: str, diffs: List[Dict[str, Any]]) -> dict:
+    if not diffs:
+        return {"storedCount": 0}
+    coll = get_diffs_collection()
+
+    try:
+        coll.delete(where={"repoPath": repo_path})
+    except Exception:
+        pass
+
+    ids = []
+    documents = []
+    metadatas = []
+
+    for i, diff in enumerate(diffs):
+        h = diff.get("hash", f"h_{i}")
+        ids.append(f"diff_{h[:8]}_{i}")
+        intent = diff.get("intentSummary") or ""
+        snippet = diff.get("diffSnippet") or ""
+        documents.append(f"{intent}\n\nDiff details:\n{snippet}")
+        metadatas.append({
+            "repoPath": repo_path,
+            "hash": h,
+            "author": diff.get("author") or "Unknown",
+            "date": diff.get("date") or "",
+            "rawMessage": diff.get("rawMessage") or "",
+            "isSynthesized": "true" if diff.get("isSynthesized") else "false"
+        })
+
+    BATCH_SIZE = 20
+    for i in range(0, len(ids), BATCH_SIZE):
+        coll.add(
+            ids=ids[i:i + BATCH_SIZE],
+            documents=documents[i:i + BATCH_SIZE],
+            metadatas=metadatas[i:i + BATCH_SIZE]
+        )
+
+    return {"storedCount": len(diffs)}
+
+async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 6) -> dict:
+    code_coll = get_code_collection()
+    diffs_coll = get_diffs_collection()
+
+    where_filter = {"repoPath": repo_path} if repo_path else None
+
+    # 1. Query Code
+    try:
+        code_res = code_coll.query(query_texts=[question], n_results=top_k, where=where_filter)
+    except Exception:
+        code_res = None
+
+    if not code_res or not code_res.get("documents") or not code_res["documents"][0]:
+        try:
+            code_res = code_coll.query(query_texts=[question], n_results=top_k)
+        except Exception:
+            code_res = None
+
+    # 2. Query Historical Diffs
+    try:
+        diffs_res = diffs_coll.query(query_texts=[question], n_results=3, where=where_filter)
+    except Exception:
+        diffs_res = None
+
+    if not diffs_res or not diffs_res.get("documents") or not diffs_res["documents"][0]:
+        try:
+            diffs_res = diffs_coll.query(query_texts=[question], n_results=3)
+        except Exception:
+            diffs_res = None
+
+    code_matches = []
+    if code_res and code_res.get("documents") and code_res["documents"][0]:
+        docs = code_res["documents"][0]
+        metas = code_res["metadatas"][0] if code_res.get("metadatas") else [{}] * len(docs)
+        distances = code_res["distances"][0] if code_res.get("distances") else [None] * len(docs)
+        for i, doc in enumerate(docs):
+            code_matches.append({
+                "type": "code",
+                "content": doc,
+                "metadata": metas[i] if i < len(metas) else {},
+                "distance": distances[i] if i < len(distances) else None
+            })
+
+    diff_matches = []
+    if diffs_res and diffs_res.get("documents") and diffs_res["documents"][0]:
+        docs = diffs_res["documents"][0]
+        metas = diffs_res["metadatas"][0] if diffs_res.get("metadatas") else [{}] * len(docs)
+        distances = diffs_res["distances"][0] if diffs_res.get("distances") else [None] * len(docs)
+        for i, doc in enumerate(docs):
+            diff_matches.append({
+                "type": "git_archaeology",
+                "content": doc,
+                "metadata": metas[i] if i < len(metas) else {},
+                "distance": distances[i] if i < len(distances) else None
+            })
+
+    return {
+        "codeMatches": code_matches,
+        "diffMatches": diff_matches
+    }
+
+async def get_repo_vector_stats(repo_path: str) -> dict:
+    try:
+        coll = get_code_collection()
+        res = coll.get(where={"repoPath": repo_path}, limit=10000, include=["metadatas"])
+        if not res or not res.get("ids"):
+            return {"exists": False, "count": 0, "filesCount": 0}
+        
+        file_paths = set()
+        for meta in (res.get("metadatas") or []):
+            if meta and meta.get("filePath"):
+                file_paths.add(meta["filePath"])
+
+        return {
+            "exists": True,
+            "count": len(res["ids"]),
+            "filesCount": len(file_paths)
+        }
+    except Exception as e:
+        logger.warning(f"Error getting repo vector stats: {e}")
+        return {"exists": False, "count": 0, "filesCount": 0}
+
+async def clear_repo_vectors(repo_path: str) -> dict:
+    try:
+        code_coll = get_code_collection()
+        diffs_coll = get_diffs_collection()
+        code_coll.delete(where={"repoPath": repo_path})
+        diffs_coll.delete(where={"repoPath": repo_path})
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
