@@ -6,7 +6,10 @@ from git import Repo
 
 from .ast_parser import scan_directory, parse_code_file, build_dependency_graph
 from .git_archaeology import analyze_git_archaeology
-from .chroma_service import store_code_chunks, store_diff_summaries, search_codebase, get_repo_vector_stats
+from .chroma_service import (
+    store_code_chunks, store_diff_summaries, search_codebase, get_repo_vector_stats,
+    store_query_cache, find_semantic_query_match, clear_query_cache
+)
 from .redis_service import cache_service
 from .llm_provider import get_chat_model
 
@@ -82,6 +85,9 @@ async def ingest_codebase(
                 "graphLinksCount": len(cached_graph.get("links", []))
             }
 
+    # Clear existing semantic query cache on fresh/force re-ingestion
+    await clear_query_cache(repo_path)
+
     # 2. File Discovery
     notify({"step": "scanning", "message": "Scanning directory tree and detecting programming languages..."})
     file_paths = scan_directory(repo_path)
@@ -133,13 +139,39 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     if not question:
         raise ValueError("Question is required.")
 
+    # Tier 1: Fast Exact Redis Cache Lookup
     cache_key = f"query:{repo_path}:{question.strip().lower()}"
     if not refresh:
         cached = await cache_service.get(cache_key)
         if cached and cached.get("answer") and len(cached["answer"]) > 200:
-            return {**cached, "fromCache": True}
+            logger.info(f"[Cache] ⚡ Returning exact match from Redis for: '{question}'")
+            return {**cached, "fromCache": True, "cacheType": "exact_redis"}
 
-    # 1. Dual-Vector Search
+        # Tier 2: Offline-Ready Semantic Vector Cache (ChromaDB all-MiniLM-L6-v2)
+        semantic_match = await find_semantic_query_match(repo_path, question, threshold=0.85)
+        if semantic_match and semantic_match.get("matched") and semantic_match.get("answer"):
+            logger.info(
+                f"[Semantic Cache] ⚡ Returning semantic match ({semantic_match['similarity']*100:.1f}%) "
+                f"for '{question}' -> matched: '{semantic_match['matchedQuestion']}'"
+            )
+            return {
+                "answer": semantic_match["answer"],
+                "question": question,
+                "matchedQuestion": semantic_match["matchedQuestion"],
+                "similarity": semantic_match["similarity"],
+                "fromCache": True,
+                "semanticCache": True,
+                "cacheType": "semantic_chromadb",
+                "codeMatches": semantic_match.get("codeCitations", []),
+                "diffMatches": semantic_match.get("gitCitations", []),
+                "citations": [
+                    f"{c.get('filePath')}:{c.get('startLine')}-{c.get('endLine')}"
+                    for c in semantic_match.get("codeCitations", [])
+                    if isinstance(c, dict) and c.get("filePath")
+                ]
+            }
+
+    # 1. Dual-Vector Search (Current Code + Historical Diffs)
     matches = await search_codebase(repo_path=repo_path, question=question, top_k=5)
     code_matches = matches.get("codeMatches", [])
     diff_matches = matches.get("diffMatches", [])
@@ -189,23 +221,84 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         "Answer:"
     )
 
-    chat_model = get_chat_model(temperature=0.2)
-    response = await chat_model.ainvoke(system_prompt)
-    if isinstance(response.content, str):
-        answer_text = response.content
-    elif isinstance(response.content, list):
-        answer_text = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in response.content)
-    else:
-        answer_text = str(response.content)
+    try:
+        chat_model = get_chat_model(temperature=0.2)
+        response = await chat_model.ainvoke(system_prompt)
+        if isinstance(response.content, str):
+            answer_text = response.content
+        elif isinstance(response.content, list):
+            answer_text = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in response.content)
+        else:
+            answer_text = str(response.content)
+    except Exception as llm_error:
+        logger.warning(f"[LLM] Cloud LLM unavailable ({llm_error}). Checking offline semantic fallback...")
+        # Offline Resilience: Check if we have an approximate semantic match (>= 0.65 similarity)
+        fallback_match = await find_semantic_query_match(repo_path, question, threshold=0.65)
+        if fallback_match and fallback_match.get("answer"):
+            logger.info(f"[Offline Mode] 🛡️ Recovered using offline semantic match: '{fallback_match['matchedQuestion']}'")
+            return {
+                "answer": (
+                    f"> ⚡ **[Offline Mode Active]** Network connection to cloud LLM is offline. "
+                    f"Showing nearest semantic match ({fallback_match['similarity']*100:.1f}% match to: *\"{fallback_match['matchedQuestion']}\"*):\n\n"
+                    + fallback_match["answer"]
+                ),
+                "question": question,
+                "matchedQuestion": fallback_match["matchedQuestion"],
+                "similarity": fallback_match["similarity"],
+                "fromCache": True,
+                "semanticCache": True,
+                "offlineFallback": True,
+                "cacheType": "offline_semantic_fallback",
+                "codeMatches": code_matches,
+                "diffMatches": diff_matches,
+                "citations": list(set(citations))
+            }
+        raise RuntimeError(
+            f"RepoSage is currently offline and unable to reach the cloud LLM, and no semantically similar question "
+            f"has been cached locally yet. (Original error: {llm_error})"
+        )
+
+    code_meta_list = [
+        {
+            "filePath": c.get("metadata", {}).get("filePath"),
+            "name": c.get("metadata", {}).get("name"),
+            "startLine": c.get("metadata", {}).get("startLine"),
+            "endLine": c.get("metadata", {}).get("endLine"),
+            "snippet": (c.get("content") or "")[:300]
+        }
+        for c in code_matches
+    ]
+
+    git_meta_list = [
+        {
+            "hash": d.get("metadata", {}).get("hash"),
+            "author": d.get("metadata", {}).get("author"),
+            "date": d.get("metadata", {}).get("date"),
+            "summary": (d.get("content") or "")[:200]
+        }
+        for d in diff_matches
+    ]
 
     result = {
-
         "answer": answer_text,
         "question": question,
         "codeMatches": code_matches,
         "diffMatches": diff_matches,
+        "codeCitations": code_meta_list,
+        "gitCitations": git_meta_list,
         "citations": list(set(citations))
     }
 
+    # Cache in Redis (Fast Exact Tier)
     await cache_service.set(cache_key, result, 86400)
+
+    # Cache in ChromaDB reposage_queries (Local Semantic Vector Tier)
+    await store_query_cache(
+        repo_path=repo_path,
+        question=question,
+        answer=answer_text,
+        code_citations=code_meta_list,
+        git_citations=git_meta_list
+    )
+
     return result

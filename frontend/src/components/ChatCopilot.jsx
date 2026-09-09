@@ -20,7 +20,7 @@ export default function ChatCopilot({ activeRepo }) {
     "Show me architectural decisions revealed by Git Archaeology."
   ];
 
-  const handleSend = async (questionText) => {
+  const handleSend = async (questionText, forceRefresh = false) => {
     const q = questionText || input;
     if (!q.trim() || loading) return;
 
@@ -36,7 +36,7 @@ export default function ChatCopilot({ activeRepo }) {
         body: JSON.stringify({
           repoPath: activeRepo,
           question: q,
-          refresh: true
+          refresh: Boolean(forceRefresh)
         })
       });
 
@@ -50,7 +50,12 @@ export default function ChatCopilot({ activeRepo }) {
         text: data.answer,
         codeCitations: data.codeCitations || [],
         gitCitations: data.gitCitations || [],
-        fromCache: data.fromCache
+        fromCache: data.fromCache,
+        semanticCache: data.semanticCache,
+        cacheType: data.cacheType,
+        matchedQuestion: data.matchedQuestion,
+        similarity: data.similarity,
+        offlineFallback: data.offlineFallback
       }]);
     } catch (err) {
       setMessages(prev => [...prev, {
@@ -153,8 +158,36 @@ export default function ChatCopilot({ activeRepo }) {
               lineHeight: 1.6
             }}>
               {msg.fromCache && (
-                <div style={{ fontSize: '11px', color: 'var(--success-color)', marginBottom: '6px' }}>
-                  ⚡ Cached in Redis
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                  {msg.semanticCache ? (
+                    <span style={{
+                      fontSize: '11px',
+                      backgroundColor: msg.offlineFallback ? 'rgba(245, 158, 11, 0.15)' : 'rgba(59, 130, 246, 0.15)',
+                      border: `1px solid ${msg.offlineFallback ? 'rgba(245, 158, 11, 0.35)' : 'rgba(59, 130, 246, 0.35)'}`,
+                      color: msg.offlineFallback ? '#fbbf24' : '#60a5fa',
+                      padding: '2px 8px',
+                      borderRadius: '12px',
+                      fontWeight: '500',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px'
+                    }}>
+                      ⚡ Semantic Cache Hit {msg.similarity ? `(${Math.round(msg.similarity * 100)}% match)` : ''}
+                      {msg.matchedQuestion && <span style={{ opacity: 0.85 }}>• Similar to: "{msg.matchedQuestion}"</span>}
+                    </span>
+                  ) : (
+                    <span style={{
+                      fontSize: '11px',
+                      backgroundColor: 'rgba(34, 197, 94, 0.15)',
+                      border: '1px solid rgba(34, 197, 94, 0.3)',
+                      color: '#4ade80',
+                      padding: '2px 8px',
+                      borderRadius: '12px',
+                      fontWeight: '500'
+                    }}>
+                      ⚡ Exact Cache Hit (Redis)
+                    </span>
+                  )}
                 </div>
               )}
 

@@ -1,10 +1,13 @@
 import os
 import math
+import time
+import json
 import logging
 import requests
 from typing import List, Dict, Any, Optional
 import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+import chromadb.utils.embedding_functions as chromadb_ef
 
 logger = logging.getLogger("chroma_service")
 
@@ -54,6 +57,18 @@ _client = None
 _embedding_fn = None
 _code_collection = None
 _diffs_collection = None
+_queries_collection = None
+_local_embedding_fn = None
+
+def get_local_query_embedding_function():
+    global _local_embedding_fn
+    if _local_embedding_fn is None:
+        try:
+            _local_embedding_fn = chromadb_ef.DefaultEmbeddingFunction()
+        except Exception as e:
+            logger.warning(f"[ChromaDB] DefaultEmbeddingFunction unavailable: {e}. Using resilient embedding.")
+            _local_embedding_fn = get_embedding_function()
+    return _local_embedding_fn
 
 def get_embedding_function() -> ResilientEmbeddingFunction:
     global _embedding_fn
@@ -89,13 +104,13 @@ def check_chroma_connection() -> dict:
     try:
         c = get_chroma_client()
         hb = c.heartbeat()
-        return {"connected": True, "heartbeat": hb, "embeddingType": "Gemini-004 + Resilient Hash"}
+        return {"connected": True, "heartbeat": hb, "embeddingType": "Gemini-004 + Resilient Hash + Local ONNX"}
     except Exception as e:
         return {"connected": False, "error": str(e)}
 
-def _get_or_init_collection(name: str):
+def _get_or_init_collection(name: str, embedding_fn=None):
     c = get_chroma_client()
-    ef = get_embedding_function()
+    ef = embedding_fn or get_embedding_function()
     try:
         return c.get_or_create_collection(
             name=name,
@@ -127,6 +142,13 @@ def get_diffs_collection():
     if _diffs_collection is None:
         _diffs_collection = _get_or_init_collection("reposage_diffs")
     return _diffs_collection
+
+def get_queries_collection():
+    global _queries_collection
+    if _queries_collection is None:
+        local_ef = get_local_query_embedding_function()
+        _queries_collection = _get_or_init_collection("reposage_queries", embedding_fn=local_ef)
+    return _queries_collection
 
 async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]]) -> dict:
     coll = get_code_collection()
@@ -292,8 +314,145 @@ async def clear_repo_vectors(repo_path: str) -> dict:
     try:
         code_coll = get_code_collection()
         diffs_coll = get_diffs_collection()
+        queries_coll = get_queries_collection()
         code_coll.delete(where={"repoPath": repo_path})
         diffs_coll.delete(where={"repoPath": repo_path})
+        try:
+            queries_coll.delete(where={"repoPath": repo_path})
+        except Exception:
+            pass
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+async def store_query_cache(
+    repo_path: Optional[str],
+    question: str,
+    answer: str,
+    code_citations: Optional[List[Any]] = None,
+    git_citations: Optional[List[Any]] = None
+) -> dict:
+    """
+    Store an answered question into the semantic vector cache using local ONNX embeddings.
+    """
+    if not question or not answer:
+        return {"stored": False}
+    try:
+        coll = get_queries_collection()
+        clean_q = question.strip()
+        uid = f"sq_{abs(hash(f'{repo_path}:{clean_q.lower()}')) % 100000000}_{int(time.time())}"
+        
+        # Serialize citations for retrieval
+        code_c_json = json.dumps(code_citations or [])[:3000]
+        git_c_json = json.dumps(git_citations or [])[:3000]
+        
+        coll.add(
+            ids=[uid],
+            documents=[clean_q],
+            metadatas=[{
+                "repoPath": repo_path or "global",
+                "question": clean_q,
+                "answer": answer[:8000],
+                "codeCitations": code_c_json,
+                "gitCitations": git_c_json,
+                "timestamp": int(time.time())
+            }]
+        )
+        logger.info(f"[Semantic Cache] 💾 Cached query embedding for: '{clean_q}'")
+        return {"stored": True, "id": uid}
+    except Exception as e:
+        logger.warning(f"[Semantic Cache] Store error: {e}")
+        return {"stored": False, "error": str(e)}
+
+async def find_semantic_query_match(
+    repo_path: Optional[str],
+    question: str,
+    threshold: float = 0.85
+) -> Optional[Dict[str, Any]]:
+    """
+    Find a semantically similar cached question using local ONNX embeddings.
+    Cosine similarity = 1 - distance. If sim >= threshold (e.g. 0.85), returns cached answer.
+    """
+    if not question or not question.strip():
+        return None
+    try:
+        coll = get_queries_collection()
+        where_filter = {"repoPath": repo_path} if repo_path else None
+        
+        res = coll.query(
+            query_texts=[question.strip()],
+            n_results=1,
+            where=where_filter,
+            include=["documents", "metadatas", "distances"]
+        )
+        
+        # If repo-filtered returned no results, check without where filter
+        if not res or not res.get("documents") or not res["documents"][0]:
+            try:
+                res = coll.query(
+                    query_texts=[question.strip()],
+                    n_results=1,
+                    include=["documents", "metadatas", "distances"]
+                )
+            except Exception:
+                res = None
+
+        if res and res.get("documents") and res["documents"][0] and len(res["documents"][0]) > 0:
+            dist = res["distances"][0][0]
+            sim = max(0.0, 1.0 - dist)
+            meta = res["metadatas"][0][0] if res.get("metadatas") and res["metadatas"][0] else {}
+            doc_text = res["documents"][0][0]
+            
+            code_citations = []
+            git_citations = []
+            try:
+                if meta.get("codeCitations"):
+                    code_citations = json.loads(meta["codeCitations"])
+                if meta.get("gitCitations"):
+                    git_citations = json.loads(meta["gitCitations"])
+            except Exception:
+                pass
+
+            matched_obj = {
+                "matched": sim >= threshold,
+                "similarity": round(float(sim), 4),
+                "distance": round(float(dist), 4),
+                "matchedQuestion": meta.get("question", doc_text),
+                "answer": meta.get("answer", ""),
+                "codeCitations": code_citations,
+                "gitCitations": git_citations,
+                "timestamp": meta.get("timestamp", 0)
+            }
+
+            if matched_obj["matched"]:
+                logger.info(
+                    f"[Semantic Cache] ⚡ Cache HIT ({matched_obj['similarity'] * 100:.1f}%)! "
+                    f"Queried: '{question.strip()}' -> Matched: '{matched_obj['matchedQuestion']}'"
+                )
+            else:
+                logger.info(
+                    f"[Semantic Cache] Candidate found ({matched_obj['similarity'] * 100:.1f}% < {threshold * 100:.0f}%): "
+                    f"'{matched_obj['matchedQuestion']}'"
+                )
+
+            return matched_obj
+
+    except Exception as e:
+        logger.warning(f"[Semantic Cache] Lookup error: {e}")
+        return None
+    return None
+
+async def clear_query_cache(repo_path: Optional[str] = None) -> dict:
+    try:
+        coll = get_queries_collection()
+        if repo_path:
+            coll.delete(where={"repoPath": repo_path})
+        else:
+            c = get_chroma_client()
+            c.delete_collection("reposage_queries")
+            global _queries_collection
+            _queries_collection = None
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
