@@ -32,7 +32,7 @@ export default function ArchitectureGraph({ activeRepo }) {
 
   const filteredNodes = filter === 'all'
     ? graphData.nodes
-    : graphData.nodes.filter(n => n.category === filter);
+    : graphData.nodes.filter(n => n.type === filter);
 
   const outgoingLinks = selectedNode
     ? graphData.links.filter(l => l.source === selectedNode.id)
@@ -53,7 +53,7 @@ export default function ArchitectureGraph({ activeRepo }) {
 
         {/* Filter buttons */}
         <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-          {['all', 'api', 'service', 'data', 'utility'].map(cat => (
+          {['all', 'code', 'config', 'doc'].map(cat => (
             <button
               key={cat}
               onClick={() => setFilter(cat)}
@@ -110,13 +110,13 @@ export default function ArchitectureGraph({ activeRepo }) {
                   }}
                 >
                   <div style={{ fontSize: '10.5px', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: '600' }}>
-                    {node.category}
+                    {node.type}
                   </div>
                   <div style={{ fontSize: '13px', fontWeight: '500', color: 'var(--text-primary)', marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {node.name}
                   </div>
                   <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                    {node.chunksCount} blocks
+                    {node.metrics?.chunks ?? 0} blocks
                   </div>
                 </div>
               );
@@ -128,7 +128,7 @@ export default function ArchitectureGraph({ activeRepo }) {
             <div style={{ backgroundColor: '#18181b', borderRadius: '6px', border: '1px solid var(--border-color)', padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
               <div>
                 <span style={{ fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase' }}>
-                  {selectedNode.category}
+                  {selectedNode.type}
                 </span>
                 <h3 style={{ fontSize: '14px', fontWeight: '600', color: 'var(--text-primary)', marginTop: '2px', wordBreak: 'break-word' }}>
                   {selectedNode.name}

@@ -15,7 +15,8 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
   }, [activeRepo]);
 
   const startIngestion = (force = false) => {
-    if (!repoPath) return;
+    const requestedPath = repoPath.trim();
+    if (!requestedPath) return;
 
     setIsIngesting(true);
     setError(null);
@@ -23,7 +24,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     setCurrentStep('Connecting to codebase...');
 
     const forceParam = force ? '&force=true' : '';
-    const eventSource = new EventSource(`${API_BASE}/api/ingest-stream?path=${encodeURIComponent(repoPath)}${forceParam}`);
+    const eventSource = new EventSource(`${API_BASE}/api/ingest-stream?path=${encodeURIComponent(requestedPath)}${forceParam}`);
 
     eventSource.onmessage = (event) => {
       try {
@@ -40,7 +41,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
           setStats(data.stats);
           eventSource.close();
           setIsIngesting(false);
-          if (onIngestionComplete) onIngestionComplete(repoPath, data.stats);
+          if (onIngestionComplete) onIngestionComplete(requestedPath, data.stats);
         } else if (data.step === 'error') {
           setError(data.error);
           setIsIngesting(false);
@@ -52,6 +53,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     };
 
     eventSource.onerror = () => {
+      setError((previous) => previous || 'The analysis connection closed unexpectedly. Ensure the backend is running and try again.');
       eventSource.close();
       setIsIngesting(false);
     };
@@ -65,7 +67,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
             Codebase Ingestion
           </h2>
           <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '2px' }}>
-            Enter a local folder path or paste any public <strong>GitHub URL</strong>.
+            Paste a public <strong>GitHub URL</strong>, or enter a local folder mounted for the backend.
           </p>
         </div>
 
@@ -93,7 +95,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
           className="ingestion-input"
           value={repoPath}
           onChange={(e) => setRepoPath(e.target.value)}
-          placeholder="e.g. https://github.com/vbv0507/RepoSage or https://github.com/expressjs/express"
+          placeholder="e.g. https://github.com/vbv0507/RepoSage"
           disabled={isIngesting}
         />
         <button
@@ -129,6 +131,10 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
           {error}
         </div>
       )}
+
+      <p style={{ marginTop: '8px', fontSize: '11.5px', color: 'var(--text-muted)' }}>
+        Hosted deployments can analyze GitHub URLs. For Windows folders in Docker, configure <code>HOST_REPO_ROOT</code> in <code>.env</code> and restart the stack.
+      </p>
 
       {stats && (
         <>

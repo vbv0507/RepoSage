@@ -1,5 +1,6 @@
 import os
 import re
+import ntpath
 import logging
 from typing import Dict, Any, Callable, Optional
 from git import Repo
@@ -15,6 +16,61 @@ from .llm_provider import get_chat_model
 
 logger = logging.getLogger("rag_service")
 
+WINDOWS_PATH = re.compile(r"^[a-zA-Z]:[\\\\/]")
+
+
+def _normalise_windows_path(path: str) -> str:
+    """Return a comparison-safe, absolute Windows path without touching the host FS."""
+    return ntpath.normpath(path).replace("/", "\\").rstrip("\\").casefold()
+
+
+def _windows_path_with_case(path: str) -> str:
+    """Normalize separators while preserving the casing needed by Linux mounts."""
+    return ntpath.normpath(path).replace("/", "\\").rstrip("\\")
+
+
+def _resolve_local_path(path: str) -> str:
+    """Resolve a local path, including an optional Windows-host-to-container mapping.
+
+    Docker containers cannot see arbitrary folders from the Windows host.  Compose
+    mounts HOST_REPO_ROOT at /workspace and this function maps a path typed in the
+    browser below that host root to the corresponding container path.
+    """
+    if WINDOWS_PATH.match(path) and os.name != "nt":
+        host_root = os.getenv("HOST_REPO_ROOT", "").strip()
+        mount_root = os.getenv("REPO_MOUNT_PATH", "/workspace")
+        if not host_root:
+            raise ValueError(
+                "This server is running in Docker and cannot read a Windows path yet. "
+                "Set HOST_REPO_ROOT to the host folder mounted at /workspace, then try again. "
+                "For a hosted deployment, use a public GitHub URL instead."
+            )
+
+        source_for_mapping = _windows_path_with_case(path)
+        root_for_mapping = _windows_path_with_case(host_root)
+        source = source_for_mapping.casefold()
+        root = root_for_mapping.casefold()
+        if source != root and not source.startswith(root + "\\"):
+            raise ValueError(
+                f"The folder '{path}' is outside the configured HOST_REPO_ROOT ({host_root}). "
+                "Choose a folder beneath that root or update HOST_REPO_ROOT."
+            )
+        # Compare case-insensitively (Windows behavior), but retain the input
+        # casing because the destination filesystem in Docker is case-sensitive.
+        relative = source_for_mapping[len(root_for_mapping):].lstrip("\\")
+        resolved = os.path.abspath(os.path.join(mount_root, *relative.split("\\")))
+    else:
+        resolved = os.path.abspath(os.path.expanduser(path))
+
+    if not os.path.isdir(resolved):
+        raise ValueError(
+            f"Local repository folder was not found or is not mounted: {path}. "
+            f"Resolved server path: {resolved}"
+        )
+    if not os.access(resolved, os.R_OK):
+        raise ValueError(f"Local repository folder is not readable by the server: {path}")
+    return resolved
+
 def resolve_repo_path(input_path: str, on_progress: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
     if not input_path:
         raise ValueError("Repository path or URL is required.")
@@ -22,7 +78,7 @@ def resolve_repo_path(input_path: str, on_progress: Optional[Callable[[Dict[str,
 
     is_remote = bool(re.match(r'^(https?://|git@)', trimmed, re.IGNORECASE))
     if not is_remote:
-        return os.path.abspath(trimmed)
+        return _resolve_local_path(trimmed)
 
     repo_name = trimmed.rstrip('/').split('/')[-1].replace('.git', '') or 'remote_repo'
     clone_base = os.path.abspath('./cloned_repos')
@@ -79,8 +135,10 @@ async def ingest_codebase(
             return {
                 "repoPath": repo_path,
                 "cached": True,
+                "fromCache": True,
                 "chunksCount": stats["count"],
                 "filesCount": stats.get("filesCount", 0),
+                "gitDiffsCount": 0,
                 "graphNodesCount": len(cached_graph.get("nodes", [])),
                 "graphLinksCount": len(cached_graph.get("links", []))
             }

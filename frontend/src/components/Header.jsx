@@ -51,7 +51,7 @@ export default function Header({ health, activeRepo }) {
         {/* LLM Status */}
         <div className="header-status-item" style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: 'var(--text-secondary)' }}>
           <span className={`status-dot ${llmConfigured ? 'online' : 'warning'}`} />
-          <span style={{ whiteSpace: 'nowrap' }}>{health?.services?.llm?.provider === 'gemini' ? 'Gemini 2.5' : 'OpenAI'}</span>
+          <span style={{ whiteSpace: 'nowrap' }}>{health?.services?.llm?.provider === 'openai' ? 'OpenAI' : 'Gemini'}</span>
         </div>
       </div>
     </header>

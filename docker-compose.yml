@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
@@ -35,6 +33,17 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # The host folder that is bind-mounted below.  Needed to translate a
+      # Windows path entered in the browser to its Linux container path.
+      - HOST_REPO_ROOT=${HOST_REPO_ROOT:-}
+      - REPO_MOUNT_PATH=/workspace
+    volumes:
+      # Default: this RepoSage checkout. To analyze another local folder, set
+      # HOST_REPO_ROOT (for example C:/Users/name/OneDrive/Desktop) in .env.
+      - type: bind
+        source: ${HOST_REPO_ROOT:-.}
+        target: /workspace
+        read_only: true
     depends_on:
       - redis
       - chromadb
