@@ -2,6 +2,7 @@ import os
 import re
 import ntpath
 import logging
+import uuid
 from typing import Dict, Any, Callable, Optional
 from git import Repo
 
@@ -17,6 +18,7 @@ from .llm_provider import get_chat_model
 logger = logging.getLogger("rag_service")
 
 WINDOWS_PATH = re.compile(r"^[a-zA-Z]:[\\\\/]")
+UPLOAD_REPO_PREFIX = "upload://"
 
 
 def _normalise_windows_path(path: str) -> str:
@@ -71,10 +73,27 @@ def _resolve_local_path(path: str) -> str:
         raise ValueError(f"Local repository folder is not readable by the server: {path}")
     return resolved
 
+
+def resolve_uploaded_repo_path(repo_id: str) -> str:
+    """Resolve an opaque browser-upload repository id without accepting paths."""
+    try:
+        upload_id = str(uuid.UUID(repo_id))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("The uploaded repository reference is invalid.") from exc
+
+    upload_root = os.path.abspath(os.getenv("UPLOAD_REPO_ROOT", "/tmp/reposage_uploads"))
+    resolved = os.path.join(upload_root, upload_id)
+    if not os.path.isdir(resolved):
+        raise ValueError("The uploaded repository is no longer available. Please upload it again.")
+    return resolved
+
 def resolve_repo_path(input_path: str, on_progress: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
     if not input_path:
         raise ValueError("Repository path or URL is required.")
     trimmed = input_path.strip()
+
+    if trimmed.startswith(UPLOAD_REPO_PREFIX):
+        return resolve_uploaded_repo_path(trimmed[len(UPLOAD_REPO_PREFIX):])
 
     is_remote = bool(re.match(r'^(https?://|git@)', trimmed, re.IGNORECASE))
     if not is_remote:

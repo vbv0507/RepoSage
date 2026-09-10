@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { API_BASE } from '../config';
 
 export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
@@ -7,6 +7,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
   const [currentStep, setCurrentStep] = useState('');
   const [stats, setStats] = useState(null);
   const [error, setError] = useState(null);
+  const folderInputRef = useRef(null);
 
   useEffect(() => {
     if (activeRepo) {
@@ -14,8 +15,8 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     }
   }, [activeRepo]);
 
-  const startIngestion = (force = false) => {
-    const requestedPath = repoPath.trim();
+  const startIngestion = (force = false, pathOverride = repoPath) => {
+    const requestedPath = pathOverride.trim();
     if (!requestedPath) return;
 
     setIsIngesting(true);
@@ -59,6 +60,34 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     };
   };
 
+  const uploadFolder = async (event) => {
+    const selectedFiles = Array.from(event.target.files || []);
+    event.target.value = '';
+    if (!selectedFiles.length) return;
+
+    setIsIngesting(true);
+    setError(null);
+    setStats(null);
+    setCurrentStep(`Uploading ${selectedFiles.length} files from your selected folder...`);
+
+    try {
+      const formData = new FormData();
+      selectedFiles.forEach((file) => {
+        formData.append('files', file, file.webkitRelativePath || file.name);
+      });
+      const response = await fetch(`${API_BASE}/api/upload-repository`, { method: 'POST', body: formData });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Folder upload failed.');
+
+      setRepoPath(data.repoPath);
+      setIsIngesting(false);
+      startIngestion(false, data.repoPath);
+    } catch (uploadError) {
+      setError(uploadError.message || 'Folder upload failed.');
+      setIsIngesting(false);
+    }
+  };
+
   return (
     <div className="card ingestion-card">
       <div className="ingestion-header">
@@ -86,6 +115,23 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
           >
             expressjs/express
           </button>
+          <button
+            className="btn btn-secondary"
+            onClick={() => folderInputRef.current?.click()}
+            disabled={isIngesting}
+            style={{ fontSize: '11.5px', padding: '3px 8px' }}
+          >
+            Upload folder
+          </button>
+          <input
+            ref={folderInputRef}
+            type="file"
+            webkitdirectory=""
+            directory=""
+            multiple
+            onChange={uploadFolder}
+            style={{ display: 'none' }}
+          />
         </div>
       </div>
 
@@ -133,7 +179,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
       )}
 
       <p style={{ marginTop: '8px', fontSize: '11.5px', color: 'var(--text-muted)' }}>
-        Hosted deployments can analyze GitHub URLs. For Windows folders in Docker, configure <code>HOST_REPO_ROOT</code> in <code>.env</code> and restart the stack.
+        On this hosted app, use <strong>Upload folder</strong> for a local project (source files only, 25 MB max), or paste a public GitHub URL.
       </p>
 
       {stats && (

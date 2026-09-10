@@ -2,8 +2,11 @@ import os
 import json
 import asyncio
 import logging
+import shutil
+import uuid
+from pathlib import PurePosixPath
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -17,7 +20,8 @@ logger = logging.getLogger("reposage_backend")
 from services.redis_service import cache_service
 from services.chroma_service import check_chroma_connection
 from services.llm_provider import check_config_status
-from services.rag_service import resolve_repo_path, ingest_codebase, query_codebase
+from services.ast_parser import CODE_EXTENSIONS, IGNORED_DIRS, is_ignored_file
+from services.rag_service import UPLOAD_REPO_PREFIX, resolve_repo_path, ingest_codebase, query_codebase
 from services.tutorial_generator import stream_full_tutorial, get_cached_tutorial
 from services.queue_service import add_email_pdf_job, get_job_status
 
@@ -53,6 +57,25 @@ class EmailPdfRequest(BaseModel):
     repoPath: str
     email: str
 
+MAX_UPLOAD_FILES = 500
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _safe_uploaded_file_path(filename: str) -> Optional[PurePosixPath]:
+    """Accept only safe, parseable source files from a browser folder upload."""
+    if not filename:
+        return None
+    candidate = PurePosixPath(filename.replace("\\", "/"))
+    if candidate.is_absolute() or ".." in candidate.parts or len(candidate.parts) > 20:
+        return None
+    if any(part in IGNORED_DIRS or part.startswith(".") for part in candidate.parts[:-1]):
+        return None
+    basename = candidate.name
+    extension = candidate.suffix.lower()
+    if is_ignored_file(basename) or not (extension in CODE_EXTENSIONS or basename in {"Dockerfile", "Makefile"}):
+        return None
+    return candidate
+
 @app.get("/api/health")
 async def health_check():
     chroma = check_chroma_connection()
@@ -67,6 +90,63 @@ async def health_check():
             "chroma": chroma,
             "llm": llm
         }
+    }
+
+
+@app.post("/api/upload-repository")
+async def upload_repository(files: list[UploadFile] = File(...)):
+    """Store a browser-selected source folder for analysis in this app instance.
+
+    The API intentionally accepts source/configuration files only, limits its
+    size, and treats submitted names as relative paths to prevent traversal.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="Choose a folder containing source files first.")
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(status_code=413, detail=f"Upload at most {MAX_UPLOAD_FILES} files at a time.")
+
+    upload_root = os.path.abspath(os.getenv("UPLOAD_REPO_ROOT", "/tmp/reposage_uploads"))
+    upload_id = str(uuid.uuid4())
+    destination = os.path.join(upload_root, upload_id)
+    stored_count = 0
+    total_bytes = 0
+
+    try:
+        for uploaded in files:
+            relative_path = _safe_uploaded_file_path(uploaded.filename or "")
+            if not relative_path:
+                continue
+            target = os.path.abspath(os.path.join(destination, *relative_path.parts))
+            if os.path.commonpath([destination, target]) != destination:
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as output:
+                while chunk := await uploaded.read(1024 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail="Source upload exceeds the 25 MB limit.")
+                    output.write(chunk)
+            stored_count += 1
+    except HTTPException:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    except Exception as exc:
+        shutil.rmtree(destination, ignore_errors=True)
+        logger.error("Repository upload failed", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not store the uploaded folder.") from exc
+    finally:
+        for uploaded in files:
+            await uploaded.close()
+
+    if not stored_count:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="No supported source files were found in that folder.")
+
+    return {
+        "success": True,
+        "repoPath": f"{UPLOAD_REPO_PREFIX}{upload_id}",
+        "filesCount": stored_count,
+        "message": "Folder uploaded. Starting analysis is now safe to do."
     }
 
 @app.get("/api/ingest-stream")
