@@ -61,6 +61,7 @@ _embedding_fn = None
 _code_collection = None
 _diffs_collection = None
 _queries_collection = None
+_file_profiles_collection = None
 _local_embedding_fn = None
 
 def get_local_query_embedding_function():
@@ -152,6 +153,59 @@ def get_queries_collection():
         local_ef = get_local_query_embedding_function()
         _queries_collection = _get_or_init_collection("reposage_queries", embedding_fn=local_ef)
     return _queries_collection
+
+
+def get_file_profiles_collection():
+    global _file_profiles_collection
+    if _file_profiles_collection is None:
+        _file_profiles_collection = _get_or_init_collection("reposage_file_profiles")
+    return _file_profiles_collection
+
+
+async def store_file_profiles(repo_path: str, parsed_files: List[Dict[str, Any]], index_id: str) -> dict:
+    """Embed one compact role/symbol profile per source file for routing."""
+    coll = get_file_profiles_collection()
+    try:
+        coll.delete(where={"repoPath": repo_path})
+    except Exception as exc:
+        logger.warning("Could not clear old file profiles for %s: %s", repo_path, exc)
+    ids, documents, metadatas = [], [], []
+    for parsed in parsed_files:
+        file_path = parsed["filePath"]
+        symbols = []
+        for chunk in parsed.get("chunks", [])[:30]:
+            if chunk.get("type") in {"function", "arrow_function", "class"}:
+                symbols.append(f"{chunk.get('type')} {chunk.get('name')}: {chunk.get('summary', '')}\n{chunk.get('code', '')[:500]}")
+        profile = f"File: {file_path}\nExtension: {parsed.get('extension')}\n" + "\n".join(symbols)
+        if not symbols:
+            profile += "\nContent summary:\n" + "\n".join(chunk.get("code", "")[:300] for chunk in parsed.get("chunks", [])[:3])
+        ids.append("profile_" + hashlib.sha256(f"{repo_path}:{index_id}:{file_path}".encode()).hexdigest()[:32])
+        documents.append(profile[:12000])
+        metadatas.append({"repoPath": repo_path, "indexId": index_id, "filePath": file_path})
+    stored_count = 0
+    for offset in range(0, len(ids), 50):
+        try:
+            coll.add(
+                ids=ids[offset:offset + 50],
+                documents=documents[offset:offset + 50],
+                metadatas=metadatas[offset:offset + 50],
+            )
+            stored_count += len(ids[offset:offset + 50])
+        except Exception as exc:
+            logger.warning("Could not store file-profile batch: %s", exc)
+    return {"storedCount": stored_count}
+
+
+async def find_relevant_files(repo_path: str, index_id: str, question: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    try:
+        res = get_file_profiles_collection().query(query_texts=[question], n_results=top_k, where=_where(repo_path, index_id))
+        if not res or not res.get("metadatas") or not res["metadatas"][0]:
+            return []
+        distances = res.get("distances", [[]])[0]
+        return [{"filePath": meta.get("filePath"), "similarity": round(max(0.0, 1.0 - float(distances[i])), 4) if i < len(distances) else None} for i, meta in enumerate(res["metadatas"][0]) if meta.get("filePath")]
+    except Exception as exc:
+        logger.warning("File-profile routing failed: %s", exc)
+        return []
 
 async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]], index_id: str) -> dict:
     coll = get_code_collection()
@@ -266,7 +320,7 @@ def _matches_from_result(result: Optional[dict]) -> List[dict]:
     return matches
 
 
-async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 6, index_id: Optional[str] = None, file_path_hint: Optional[str] = None) -> dict:
+async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 6, index_id: Optional[str] = None, file_path_hint: Optional[str] = None, file_path_hints: Optional[List[str]] = None) -> dict:
     code_coll = get_code_collection()
     diffs_coll = get_diffs_collection()
 
@@ -278,7 +332,10 @@ async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 
     except Exception:
         code_res = None
 
-    if not code_res or not code_res.get("documents") or not code_res["documents"][0]:
+    # An unscoped retry is only safe for callers that intentionally did not
+    # specify a repository/index.  Otherwise it could surface another
+    # repository or a stale indexing run.
+    if (not repo_path and not index_id) and (not code_res or not code_res.get("documents") or not code_res["documents"][0]):
         try:
             code_res = code_coll.query(query_texts=[question], n_results=top_k)
         except Exception:
@@ -290,7 +347,7 @@ async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 
     except Exception:
         diffs_res = None
 
-    if not diffs_res or not diffs_res.get("documents") or not diffs_res["documents"][0]:
+    if (not repo_path and not index_id) and (not diffs_res or not diffs_res.get("documents") or not diffs_res["documents"][0]):
         try:
             diffs_res = diffs_coll.query(query_texts=[question], n_results=3)
         except Exception:
@@ -299,13 +356,16 @@ async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 
     code_matches = _matches_from_result(code_res)
     # A file-specific question needs that file's structural chunks before
     # generic semantic matches. Merge it first and deduplicate by line range.
-    if file_path_hint:
+    focused_paths = list(dict.fromkeys(([file_path_hint] if file_path_hint else []) + (file_path_hints or [])))
+    if focused_paths:
         try:
-            focused = _matches_from_result(code_coll.query(query_texts=[question], n_results=8, where=_where(repo_path, index_id, file_path_hint)))
+            focused = []
+            for focused_path in focused_paths[:3]:
+                focused.extend(_matches_from_result(code_coll.query(query_texts=[question], n_results=8, where=_where(repo_path, index_id, focused_path))))
             seen = set()
             code_matches = [match for match in focused + code_matches if not ((key := (match["metadata"].get("filePath"), match["metadata"].get("startLine"))) in seen or seen.add(key))]
         except Exception as exc:
-            logger.warning("Focused retrieval failed for %s: %s", file_path_hint, exc)
+            logger.warning("Focused retrieval failed for %s: %s", focused_paths, exc)
 
     diff_matches = []
     if diffs_res and diffs_res.get("documents") and diffs_res["documents"][0]:

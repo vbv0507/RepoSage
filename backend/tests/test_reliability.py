@@ -21,6 +21,19 @@ class FakeQueryCollection:
         }
 
 
+class FakeResponse:
+    content = "Grounded answer"
+
+
+class CapturingModel:
+    def __init__(self):
+        self.prompts = []
+
+    async def ainvoke(self, prompt):
+        self.prompts.append(prompt)
+        return FakeResponse()
+
+
 class ReliabilityTests(unittest.TestCase):
     def test_retrieval_module_is_discovered_and_limit_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -100,6 +113,41 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(result["signatureEvidenceMissing"])
         self.assertIn("can't state its actual function signatures", result["answer"])
         self.assertNotIn("retrieve(", result["answer"])
+
+    def test_indirect_role_questions_route_to_structural_chunks(self):
+        report = {"indexId": "current-index", "parsedFiles": ["src/policy/escalation_policy.py", "src/retrieval/retriever.py", "src/retrieval/corpus_builder.py", "src/evaluation/metrics.py"], "summary": {"parsed": 4, "skipped": 0}, "limits": {"maxSourceFiles": 2000}, "truncated": False}
+        cases = [
+            ("What component decides whether to auto-handle or escalate a request?", "src/policy/escalation_policy.py", "def evaluate(customer_text, classification, retrieved_evidence):"),
+            ("Where does the system figure out how relevant historical evidence is before responding?", "src/retrieval/retriever.py", "def search(query, top_k, intent_filter, evaluation_mode):"),
+            ("What part of the code prevents test data from leaking into training retrieval?", "src/retrieval/corpus_builder.py", "def build_corpus(exclude_test_data):"),
+            ("How does the system score how similar two pieces of text are?", "src/evaluation/metrics.py", "def cosine_similarity(left, right):"),
+        ]
+        model = CapturingModel()
+
+        async def route(_repo, _index, question):
+            for known_question, file_path, _declaration in cases:
+                if question == known_question:
+                    return [{"filePath": file_path, "similarity": 0.91}]
+            return []
+
+        async def retrieve(**kwargs):
+            path = kwargs["file_path_hints"][0]
+            declaration = next(item[2] for item in cases if item[1] == path)
+            return {"codeMatches": [{"type": "code", "content": declaration + "\n    return True", "metadata": {"filePath": path, "type": "function", "name": declaration.split("(")[0].replace("def ", ""), "startLine": 1, "endLine": 2}}], "diffMatches": []}
+
+        with patch.object(rag_service.cache_service, "get", new=AsyncMock(return_value=report)), \
+             patch.object(rag_service.cache_service, "set", new=AsyncMock(return_value=True)), \
+             patch.object(rag_service, "find_semantic_query_match", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service, "find_relevant_files", side_effect=route), \
+             patch.object(rag_service, "search_codebase", side_effect=retrieve), \
+             patch.object(rag_service, "get_chat_model", return_value=model), \
+             patch.object(rag_service, "store_query_cache", new=AsyncMock(return_value={"stored": True})):
+            results = [asyncio.run(rag_service.query_codebase("repo", question)) for question, _, _ in cases]
+
+        for result, (_, expected_file, declaration), prompt in zip(results, cases, model.prompts):
+            self.assertEqual(result["codeCitations"][0]["filePath"], expected_file)
+            self.assertIn(declaration, prompt)
+            self.assertNotIn("I can't state its actual function signatures", result["answer"])
 
     def test_offline_low_similarity_returns_no_confident_answer(self):
         low_match = {"matched": False, "similarity": 0.33, "matchedQuestion": "unrelated", "answer": "unrelated answer"}

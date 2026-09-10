@@ -10,7 +10,7 @@ from git import Repo
 from .ast_parser import scan_directory_with_report, parse_code_file, build_dependency_graph
 from .git_archaeology import analyze_git_archaeology
 from .chroma_service import (
-    store_code_chunks, store_diff_summaries, search_codebase, get_repo_vector_stats,
+    store_code_chunks, store_diff_summaries, store_file_profiles, find_relevant_files, search_codebase, get_repo_vector_stats,
     store_query_cache, find_semantic_query_match, clear_query_cache
 )
 from .redis_service import cache_service
@@ -243,6 +243,7 @@ async def ingest_codebase(
         ingestion_report["summary"]["truncated"] = True
         notify({"step": "warning", "message": f"{len(storage_result['failedFiles'])} source files could not be embedded; see Index coverage report."})
     await cache_service.set(f"ingestion_report:{repo_path}", ingestion_report, 86400)
+    await store_file_profiles(repo_path, parsed_files, index_id)
 
     # 6. Git Archaeology -> reposage_diffs
     notify({"step": "git_archaeology", "message": "Performing Git Archaeology on recent commits..."})
@@ -329,7 +330,9 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
 
     # 1. Dual-Vector Search (Current Code + Historical Diffs)
     file_path_hint = _file_hint(question, report)
-    matches = await search_codebase(repo_path=repo_path, question=question, top_k=5, index_id=index_id, file_path_hint=file_path_hint)
+    profile_matches = [] if file_path_hint or not (repo_path and index_id) else await find_relevant_files(repo_path, index_id, question)
+    profile_hints = [match["filePath"] for match in profile_matches if match.get("filePath")]
+    matches = await search_codebase(repo_path=repo_path, question=question, top_k=5, index_id=index_id, file_path_hint=file_path_hint, file_path_hints=profile_hints)
     code_matches = matches.get("codeMatches", [])
     diff_matches = matches.get("diffMatches", [])
 
@@ -366,7 +369,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     diff_context = "\n\n".join(diffs_blocks_str)
 
     structural_evidence = any(
-        match.get("metadata", {}).get("filePath") == file_path_hint and match.get("metadata", {}).get("type") in {"function", "arrow_function", "class"}
+        match.get("metadata", {}).get("filePath") in set(([file_path_hint] if file_path_hint else []) + profile_hints) and match.get("metadata", {}).get("type") in {"function", "arrow_function", "class"}
         for match in code_matches
     )
     if file_path_hint and _asks_for_signature(question) and not structural_evidence:
@@ -390,6 +393,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         "- Absence from retrieved snippets is NOT evidence that a component does not exist. Never state that a module/file/component is absent as a fact unless the indexed file inventory directly proves it was excluded and you explain that limitation. If evidence is incomplete, say exactly: 'I found no direct evidence in the currently indexed context; this does not prove the component is absent.'\n"
         "- When the inventory lists a relevant module but snippets were not retrieved, acknowledge the module exists in the index and avoid inventing its implementation details.\n"
         "- Do not state a function name, parameter name, or signature unless the exact declaration is present verbatim in Retrieved Code Implementations. If structural code for a named file is unavailable, state that you cannot confirm its actual signature.\n"
+        f"- Semantic file-routing candidates for this question: {', '.join(profile_hints) or 'none'}. These candidates only guide retrieval; cite retrieved code, not the candidate list.\n"
         "- If historical diffs provide context on WHY a decision or change was made, highlight it under a '🏛️ Architectural Decision History' section.\n"
         "- Use clean Markdown format with code snippets where helpful.\n\n"
         "Answer:"
