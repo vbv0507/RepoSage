@@ -81,6 +81,26 @@ class ReliabilityTests(unittest.TestCase):
         self.assertFalse(weak["matched"])
         self.assertAlmostEqual(weak["similarity"], 0.33)
 
+    def test_source_change_produces_a_new_index_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "README.md"
+            source.write_text("Escalation F1: 0.283", encoding="utf-8")
+            first = rag_service._index_id([str(source)], directory)
+            source.write_text("Escalation F1: 0.273", encoding="utf-8")
+            second = rag_service._index_id([str(source)], directory)
+        self.assertNotEqual(first, second)
+
+    def test_missing_structural_retrieval_refuses_to_invent_signature(self):
+        report = {"indexId": "current-index", "parsedFiles": ["src/retrieval/retriever.py"], "summary": {"parsed": 1, "skipped": 0}, "limits": {"maxSourceFiles": 2000}, "truncated": False}
+        plain_file_chunk = {"type": "code", "content": "retrieval module overview", "metadata": {"filePath": "src/retrieval/retriever.py", "type": "block", "startLine": 1, "endLine": 2}}
+        with patch.object(rag_service.cache_service, "get", new=AsyncMock(side_effect=[report, None, None])), \
+             patch.object(rag_service, "find_semantic_query_match", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service, "search_codebase", new=AsyncMock(return_value={"codeMatches": [plain_file_chunk], "diffMatches": []})):
+            result = asyncio.run(rag_service.query_codebase("repo", "What is the exact signature in retriever.py?"))
+        self.assertTrue(result["signatureEvidenceMissing"])
+        self.assertIn("can't state its actual function signatures", result["answer"])
+        self.assertNotIn("retrieve(", result["answer"])
+
     def test_offline_low_similarity_returns_no_confident_answer(self):
         low_match = {"matched": False, "similarity": 0.33, "matchedQuestion": "unrelated", "answer": "unrelated answer"}
         with patch.object(rag_service.cache_service, "get", new=AsyncMock(return_value=None)), \

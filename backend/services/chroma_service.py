@@ -2,6 +2,7 @@ import os
 import math
 import time
 import json
+import hashlib
 import logging
 import requests
 from typing import List, Dict, Any, Optional
@@ -152,7 +153,7 @@ def get_queries_collection():
         _queries_collection = _get_or_init_collection("reposage_queries", embedding_fn=local_ef)
     return _queries_collection
 
-async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]]) -> dict:
+async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]], index_id: str) -> dict:
     coll = get_code_collection()
     
     # Delete prior vectors for this repo
@@ -168,11 +169,12 @@ async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]]) -> dic
     for i, chunk in enumerate(chunks):
         file_path = chunk.get("filePath", "")
         start_line = chunk.get("startLine", 1)
-        uid = f"code_{abs(hash(f'{file_path}:{start_line}')) % 100000000}_{i}"
+        uid = "code_" + hashlib.sha256(f"{repo_path}:{index_id}:{file_path}:{start_line}:{i}".encode()).hexdigest()[:32]
         ids.append(uid)
         documents.append((chunk.get("code") or "")[:2000])
         metadatas.append({
             "repoPath": repo_path,
+            "indexId": index_id,
             "filePath": file_path,
             "name": chunk.get("name") or "unnamed",
             "type": chunk.get("type") or "code",
@@ -199,7 +201,7 @@ async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]]) -> dic
 
     return {"storedCount": stored_count, "failedFiles": failed_files}
 
-async def store_diff_summaries(repo_path: str, diffs: List[Dict[str, Any]]) -> dict:
+async def store_diff_summaries(repo_path: str, diffs: List[Dict[str, Any]], index_id: str) -> dict:
     if not diffs:
         return {"storedCount": 0}
     coll = get_diffs_collection()
@@ -221,6 +223,7 @@ async def store_diff_summaries(repo_path: str, diffs: List[Dict[str, Any]]) -> d
         documents.append(f"{intent}\n\nDiff details:\n{snippet}")
         metadatas.append({
             "repoPath": repo_path,
+            "indexId": index_id,
             "hash": h,
             "author": diff.get("author") or "Unknown",
             "date": diff.get("date") or "",
@@ -238,11 +241,36 @@ async def store_diff_summaries(repo_path: str, diffs: List[Dict[str, Any]]) -> d
 
     return {"storedCount": len(diffs)}
 
-async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 6) -> dict:
+def _where(repo_path: Optional[str], index_id: Optional[str] = None, file_path: Optional[str] = None) -> Optional[dict]:
+    clauses = []
+    if repo_path:
+        clauses.append({"repoPath": repo_path})
+    if index_id:
+        clauses.append({"indexId": index_id})
+    if file_path:
+        clauses.append({"filePath": file_path})
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+
+def _matches_from_result(result: Optional[dict]) -> List[dict]:
+    matches = []
+    if not result or not result.get("documents") or not result["documents"][0]:
+        return matches
+    docs = result["documents"][0]
+    metas = result.get("metadatas", [[]])[0]
+    distances = result.get("distances", [[]])[0]
+    for index, document in enumerate(docs):
+        matches.append({"type": "code", "content": document, "metadata": metas[index] if index < len(metas) else {}, "distance": distances[index] if index < len(distances) else None})
+    return matches
+
+
+async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 6, index_id: Optional[str] = None, file_path_hint: Optional[str] = None) -> dict:
     code_coll = get_code_collection()
     diffs_coll = get_diffs_collection()
 
-    where_filter = {"repoPath": repo_path} if repo_path else None
+    where_filter = _where(repo_path, index_id)
 
     # 1. Query Code
     try:
@@ -268,18 +296,16 @@ async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 
         except Exception:
             diffs_res = None
 
-    code_matches = []
-    if code_res and code_res.get("documents") and code_res["documents"][0]:
-        docs = code_res["documents"][0]
-        metas = code_res["metadatas"][0] if code_res.get("metadatas") else [{}] * len(docs)
-        distances = code_res["distances"][0] if code_res.get("distances") else [None] * len(docs)
-        for i, doc in enumerate(docs):
-            code_matches.append({
-                "type": "code",
-                "content": doc,
-                "metadata": metas[i] if i < len(metas) else {},
-                "distance": distances[i] if i < len(distances) else None
-            })
+    code_matches = _matches_from_result(code_res)
+    # A file-specific question needs that file's structural chunks before
+    # generic semantic matches. Merge it first and deduplicate by line range.
+    if file_path_hint:
+        try:
+            focused = _matches_from_result(code_coll.query(query_texts=[question], n_results=8, where=_where(repo_path, index_id, file_path_hint)))
+            seen = set()
+            code_matches = [match for match in focused + code_matches if not ((key := (match["metadata"].get("filePath"), match["metadata"].get("startLine"))) in seen or seen.add(key))]
+        except Exception as exc:
+            logger.warning("Focused retrieval failed for %s: %s", file_path_hint, exc)
 
     diff_matches = []
     if diffs_res and diffs_res.get("documents") and diffs_res["documents"][0]:
@@ -299,10 +325,10 @@ async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 
         "diffMatches": diff_matches
     }
 
-async def get_repo_vector_stats(repo_path: str) -> dict:
+async def get_repo_vector_stats(repo_path: str, index_id: Optional[str] = None) -> dict:
     try:
         coll = get_code_collection()
-        res = coll.get(where={"repoPath": repo_path}, limit=10000, include=["metadatas"])
+        res = coll.get(where=_where(repo_path, index_id), limit=10000, include=["metadatas"])
         if not res or not res.get("ids"):
             return {"exists": False, "count": 0, "filesCount": 0}
         

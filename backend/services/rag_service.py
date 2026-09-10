@@ -3,6 +3,7 @@ import re
 import ntpath
 import logging
 import uuid
+import hashlib
 from typing import Dict, Any, Callable, Optional
 from git import Repo
 
@@ -135,6 +136,38 @@ def get_latest_commit(repo_path: str) -> Optional[str]:
     except Exception:
         return None
 
+
+def _index_id(file_paths: list[str], repo_path: str) -> str:
+    """Content-address an index run so old vectors/answers cannot leak forward."""
+    digest = hashlib.sha256()
+    for file_path in sorted(file_paths):
+        digest.update(os.path.relpath(file_path, repo_path).replace("\\", "/").encode())
+        with open(file_path, "rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def _file_hint(question: str, report: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Map an explicitly named source file in a question to the indexed path."""
+    if not report:
+        return None
+    question_lower = question.lower().replace("\\", "/")
+    candidates = report.get("parsedFiles") or []
+    direct = [path for path in candidates if path.lower() in question_lower]
+    if direct:
+        return max(direct, key=len)
+    names = {os.path.basename(path).lower(): path for path in candidates}
+    for name, path in names.items():
+        if name in question_lower:
+            return path
+    return None
+
+
+def _asks_for_signature(question: str) -> bool:
+    lowered = question.lower()
+    return any(term in lowered for term in ("signature", "parameters", "arguments", "function name", "method name", "function does", "internals"))
+
 async def ingest_codebase(
     repo_path: str,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -144,36 +177,24 @@ async def ingest_codebase(
         if on_progress:
             on_progress(data)
 
-    current_commit = get_latest_commit(repo_path)
-
-    # 1. Check if already ingested
-    if not force_refresh:
-        stats = await get_repo_vector_stats(repo_path)
-        cached_graph = await cache_service.get(f"graph:{repo_path}")
-        cached_report = await cache_service.get(f"ingestion_report:{repo_path}")
-        if stats.get("exists") and stats.get("count", 0) > 0 and cached_graph:
-            notify({"step": "cached", "message": f"Repository vectors verified ({stats['count']} chunks). Serving instantly!"})
-            notify({"step": "complete", "message": "Repository intelligence ready!"})
-            return {
-                "repoPath": repo_path,
-                "cached": True,
-                "fromCache": True,
-                "chunksCount": stats["count"],
-                "filesCount": stats.get("filesCount", 0),
-                "gitDiffsCount": 0,
-                "graphNodesCount": len(cached_graph.get("nodes", [])),
-                "graphLinksCount": len(cached_graph.get("links", [])),
-                "ingestionReport": cached_report or {"discoveredFiles": [], "skippedFiles": [], "skippedDirectories": [], "truncated": False}
-            }
-
-    # Clear existing semantic query cache on fresh/force re-ingestion
-    await clear_query_cache(repo_path)
-
-    # 2. File Discovery
+    # 1. File discovery and content fingerprint. The old implementation
+    # checked cache before observing current source content, allowing a pull
+    # or local edit to keep serving an older index indefinitely.
     notify({"step": "scanning", "message": "Scanning directory tree and detecting programming languages..."})
     file_paths, ingestion_report = scan_directory_with_report(repo_path)
     if not file_paths:
         raise ValueError(f"No parseable source code files discovered in: {repo_path}")
+    index_id = _index_id(file_paths, repo_path)
+    cached_report = await cache_service.get(f"ingestion_report:{repo_path}")
+    cached_graph = await cache_service.get(f"graph:{repo_path}")
+    stats = await get_repo_vector_stats(repo_path, index_id)
+    if not force_refresh and cached_report and cached_report.get("indexId") == index_id and stats.get("exists") and stats.get("count", 0) > 0 and cached_graph:
+        notify({"step": "cached", "message": f"Repository vectors verified ({stats['count']} chunks, index {index_id}). Serving instantly!"})
+        notify({"step": "complete", "message": "Repository intelligence ready!"})
+        return {"repoPath": repo_path, "cached": True, "fromCache": True, "indexId": index_id, "chunksCount": stats["count"], "filesCount": stats.get("filesCount", 0), "gitDiffsCount": 0, "graphNodesCount": len(cached_graph.get("nodes", [])), "graphLinksCount": len(cached_graph.get("links", [])), "ingestionReport": cached_report}
+
+    # Clear semantic answers before publishing the new run.
+    await clear_query_cache(repo_path)
 
     notify({"step": "found_files", "message": f"Discovered {len(file_paths)} source files.", "count": len(file_paths)})
 
@@ -200,6 +221,7 @@ async def ingest_codebase(
     graph = build_dependency_graph(parsed_files)
     await cache_service.set(f"graph:{repo_path}", graph, 86400)
     ingestion_report["parsedFiles"] = [item["filePath"] for item in parsed_files]
+    ingestion_report["indexId"] = index_id
     ingestion_report["filesWithChunks"] = [item["filePath"] for item in parsed_files if item.get("chunks")]
     ingestion_report["summary"] = {
         "discovered": len(ingestion_report["discoveredFiles"]),
@@ -211,7 +233,7 @@ async def ingest_codebase(
     }
     # 5. Store in ChromaDB reposage_code
     notify({"step": "storing_code", "message": f"Indexing and storing {len(all_chunks)} code blocks into vector database..."})
-    storage_result = await store_code_chunks(repo_path, all_chunks)
+    storage_result = await store_code_chunks(repo_path, all_chunks, index_id)
     if storage_result.get("failedFiles"):
         ingestion_report["embeddingFailures"] = storage_result["failedFiles"]
         ingestion_report["skippedFiles"].extend(storage_result["failedFiles"])
@@ -227,12 +249,13 @@ async def ingest_codebase(
     diffs = await analyze_git_archaeology(repo_path, max_commits=15)
     if diffs:
         notify({"step": "embedding_git", "message": f"Indexing {len(diffs)} historical Git diffs into vector database..."})
-        await store_diff_summaries(repo_path, diffs)
+        await store_diff_summaries(repo_path, diffs, index_id)
 
     notify({"step": "complete", "message": "Repository ingestion complete!"})
 
     return {
         "repoPath": repo_path,
+        "indexId": index_id,
         "filesCount": len(file_paths),
         "chunksCount": len(all_chunks),
         "gitDiffsCount": len(diffs),
@@ -269,9 +292,11 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     if not question:
         raise ValueError("Question is required.")
 
+    report = await cache_service.get(f"ingestion_report:{repo_path}") if repo_path else None
+    index_id = report.get("indexId") if report else None
     # Tier 1: Fast Exact Redis Cache Lookup
     # Versioned key avoids returning pre-trust-calibration cached answers.
-    cache_key = f"query:v2:{repo_path}:{question.strip().lower()}"
+    cache_key = f"query:v3:{repo_path}:{index_id}:{question.strip().lower()}"
     if not refresh:
         cached = await cache_service.get(cache_key)
         if cached and cached.get("answer") and len(cached["answer"]) > 200:
@@ -279,7 +304,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
             return {**cached, "fromCache": True, "cacheType": "exact_redis"}
 
         # Tier 2: Offline-Ready Semantic Vector Cache (ChromaDB all-MiniLM-L6-v2)
-        semantic_match = await find_semantic_query_match(repo_path, question, threshold=SEMANTIC_CACHE_DIRECT_THRESHOLD)
+        semantic_match = await find_semantic_query_match(f"{repo_path}:{index_id}", question, threshold=SEMANTIC_CACHE_DIRECT_THRESHOLD)
         if semantic_match and semantic_match.get("matched") and semantic_match.get("answer"):
             logger.info(
                 f"[Semantic Cache] ⚡ Returning semantic match ({semantic_match['similarity']*100:.1f}%) "
@@ -303,7 +328,8 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
             }
 
     # 1. Dual-Vector Search (Current Code + Historical Diffs)
-    matches = await search_codebase(repo_path=repo_path, question=question, top_k=5)
+    file_path_hint = _file_hint(question, report)
+    matches = await search_codebase(repo_path=repo_path, question=question, top_k=5, index_id=index_id, file_path_hint=file_path_hint)
     code_matches = matches.get("codeMatches", [])
     diff_matches = matches.get("diffMatches", [])
 
@@ -312,7 +338,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     coverage_context = ""
     if repo_path:
         cached_graph = await cache_service.get(f"graph:{repo_path}")
-        coverage_context = _build_coverage_context(await cache_service.get(f"ingestion_report:{repo_path}"))
+        coverage_context = _build_coverage_context(report)
         if cached_graph and cached_graph.get("links"):
             top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
             graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
@@ -339,6 +365,18 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     code_context = "\n\n".join(code_blocks_str)
     diff_context = "\n\n".join(diffs_blocks_str)
 
+    structural_evidence = any(
+        match.get("metadata", {}).get("filePath") == file_path_hint and match.get("metadata", {}).get("type") in {"function", "arrow_function", "class"}
+        for match in code_matches
+    )
+    if file_path_hint and _asks_for_signature(question) and not structural_evidence:
+        return {
+            "answer": f"I can confirm `{file_path_hint}` exists in the indexed repository, but I do not have its function-level AST content in the current retrieval results. I can't state its actual function signatures from this context.",
+            "question": question, "codeMatches": code_matches, "diffMatches": diff_matches,
+            "signatureEvidenceMissing": True,
+            "citations": list(set(citations))
+        }
+
     system_prompt = (
         "You are RepoSage, a Principal Software Architect AI specializing in legacy codebase intelligence and architectural decision tracing.\n\n"
         "Your goal is to answer the developer's question accurately, citing specific files, functions, line numbers, and historical git reasons.\n\n"
@@ -351,6 +389,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         "- Reference exact file names and line ranges when discussing code.\n"
         "- Absence from retrieved snippets is NOT evidence that a component does not exist. Never state that a module/file/component is absent as a fact unless the indexed file inventory directly proves it was excluded and you explain that limitation. If evidence is incomplete, say exactly: 'I found no direct evidence in the currently indexed context; this does not prove the component is absent.'\n"
         "- When the inventory lists a relevant module but snippets were not retrieved, acknowledge the module exists in the index and avoid inventing its implementation details.\n"
+        "- Do not state a function name, parameter name, or signature unless the exact declaration is present verbatim in Retrieved Code Implementations. If structural code for a named file is unavailable, state that you cannot confirm its actual signature.\n"
         "- If historical diffs provide context on WHY a decision or change was made, highlight it under a '🏛️ Architectural Decision History' section.\n"
         "- Use clean Markdown format with code snippets where helpful.\n\n"
         "Answer:"
@@ -368,7 +407,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     except Exception as llm_error:
         logger.warning(f"[LLM] Cloud LLM unavailable ({llm_error}). Checking offline semantic fallback...")
         # Offline Resilience: Check if we have an approximate semantic match (>= 0.65 similarity)
-        fallback_match = await find_semantic_query_match(repo_path, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
+        fallback_match = await find_semantic_query_match(f"{repo_path}:{index_id}", question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
         if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
             logger.info(f"[Offline Mode] 🛡️ Recovered using offline semantic match: '{fallback_match['matchedQuestion']}'")
             return {
@@ -435,7 +474,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
 
     # Cache in ChromaDB reposage_queries (Local Semantic Vector Tier)
     await store_query_cache(
-        repo_path=repo_path,
+        repo_path=f"{repo_path}:{index_id}",
         question=question,
         answer=answer_text,
         code_citations=code_meta_list,
