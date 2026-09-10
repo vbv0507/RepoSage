@@ -166,16 +166,26 @@ async def ingest_stream(
 
     async def event_generator():
         queue = asyncio.Queue()
+        event_loop = asyncio.get_running_loop()
 
         def on_progress(data: dict):
-            queue.put_nowait(data)
+            # Analysis runs outside the event loop because Git, ChromaDB, and
+            # embeddings use blocking clients. This bridge is thread-safe.
+            event_loop.call_soon_threadsafe(queue.put_nowait, data)
 
         async def worker():
             try:
-                resolved = resolve_repo_path(path, on_progress=on_progress)
-                on_progress({"step": "start", "message": f"Starting analysis for: {resolved}"})
-                stats = await ingest_codebase(resolved, on_progress=on_progress, force_refresh=force_refresh)
-                on_progress({"step": "finished", "stats": stats, "resolvedPath": resolved})
+                def run_analysis():
+                    resolved = resolve_repo_path(path, on_progress=on_progress)
+                    on_progress({"step": "start", "message": f"Starting analysis for: {resolved}"})
+                    stats = asyncio.run(
+                        ingest_codebase(resolved, on_progress=on_progress, force_refresh=force_refresh)
+                    )
+                    on_progress({"step": "finished", "stats": stats, "resolvedPath": resolved})
+
+                # Keep the ASGI event loop free so the SSE stream can emit
+                # heartbeats while a forced re-index is embedding code.
+                await asyncio.to_thread(run_analysis)
             except Exception as e:
                 logger.error(f"Ingest stream error: {e}", exc_info=True)
                 on_progress({"step": "error", "error": str(e)})
@@ -185,7 +195,13 @@ async def ingest_stream(
         task = asyncio.create_task(worker())
 
         while True:
-            item = await queue.get()
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=10)
+            except asyncio.TimeoutError:
+                # Prevent Azure/NGINX idle connection timeouts during a long
+                # vector batch. SSE comments are ignored by the UI.
+                yield ": keep-alive\n\n"
+                continue
             if "__done__" in item:
                 break
             yield f"data: {json.dumps(item)}\n\n"

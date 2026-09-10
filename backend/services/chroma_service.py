@@ -34,7 +34,9 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
                     for text in input
                 ]
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={self.api_key}"
-                resp = requests.post(url, json={"requests": requests_data}, timeout=15)
+                # A fast fallback is preferable to making a browser wait for
+                # many sequential cloud-embedding retries during re-indexing.
+                resp = requests.post(url, json={"requests": requests_data}, timeout=(5, 10))
                 if resp.status_code == 200:
                     data = resp.json()
                     if "embeddings" in data and len(data["embeddings"]) > 0:
@@ -180,7 +182,7 @@ async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]]) -> dic
         })
 
     # Batch add
-    BATCH_SIZE = 25
+    BATCH_SIZE = 50
     for i in range(0, len(ids), BATCH_SIZE):
         b_ids = ids[i:i + BATCH_SIZE]
         b_docs = documents[i:i + BATCH_SIZE]
@@ -455,4 +457,3 @@ async def clear_query_cache(repo_path: Optional[str] = None) -> dict:
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
-

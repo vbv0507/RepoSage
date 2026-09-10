@@ -18,11 +18,15 @@ async def analyze_git_archaeology(repo_path: str, max_commits: int = 15) -> List
         logger.warning(f"Git archaeology unavailable for {repo_path}: {e}")
         return []
 
+    # A forced re-index must not wait for up to one cloud LLM request per
+    # commit. Commit messages and diff snippets are already useful grounded
+    # archaeology context. Opt into costly generated summaries explicitly.
     chat_model = None
-    try:
-        chat_model = get_chat_model(temperature=0.1)
-    except Exception:
-        pass
+    if os.getenv("GIT_ARCHAEOLOGY_LLM_SUMMARIES", "false").lower() in {"1", "true", "yes"}:
+        try:
+            chat_model = get_chat_model(temperature=0.1)
+        except Exception:
+            pass
 
     for commit in commits:
         try:
