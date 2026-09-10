@@ -6,10 +6,11 @@ import shutil
 import uuid
 from pathlib import PurePosixPath
 from typing import Optional
-from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -57,7 +58,7 @@ class EmailPdfRequest(BaseModel):
     repoPath: str
     email: str
 
-MAX_UPLOAD_FILES = 500
+MAX_UPLOAD_FILES = 2000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
@@ -94,12 +95,18 @@ async def health_check():
 
 
 @app.post("/api/upload-repository")
-async def upload_repository(files: list[UploadFile] = File(...)):
+async def upload_repository(request: Request):
     """Store a browser-selected source folder for analysis in this app instance.
 
     The API intentionally accepts source/configuration files only, limits its
     size, and treats submitted names as relative paths to prevent traversal.
     """
+    try:
+        form = await request.form(max_files=MAX_UPLOAD_FILES, max_part_size=MAX_UPLOAD_BYTES)
+    except Exception as exc:
+        raise HTTPException(status_code=413, detail="Upload has too many files or a file exceeds the allowed size.") from exc
+
+    files = [file for file in form.getlist("files") if isinstance(file, StarletteUploadFile)]
     if not files:
         raise HTTPException(status_code=400, detail="Choose a folder containing source files first.")
     if len(files) > MAX_UPLOAD_FILES:

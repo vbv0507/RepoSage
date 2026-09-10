@@ -26,7 +26,7 @@ C:\Users\your-name\OneDrive\Desktop\HIVER
 
 The mount is read-only. Folders outside `HOST_REPO_ROOT` are deliberately rejected, rather than producing a misleading `/app/C:\...` error.
 
-For a hosted deployment, use **Upload folder** to select a local codebase in your browser (source files only; 25 MB maximum), or use a public GitHub URL. A hosted service cannot directly access an arbitrary path on your laptop.
+For a hosted deployment, use **Upload folder** to select a local codebase in your browser (source files only; 25 MB maximum; 2,000 source files maximum), or use a public GitHub URL. The browser filters `node_modules`, build output, and unsupported files before it uploads. A hosted service cannot directly access an arbitrary path on your laptop.
 
 ## Local development without Docker
 

@@ -1,6 +1,29 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { API_BASE } from '../config';
 
+const UPLOADABLE_EXTENSIONS = new Set([
+  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.go', '.java',
+  '.cpp', '.c', '.h', '.cs', '.rs', '.php', '.rb', '.sql', '.json',
+  '.yaml', '.yml', '.md'
+]);
+const IGNORED_UPLOAD_DIRECTORIES = new Set([
+  'node_modules', '.git', 'dist', 'build', '.next', '.nuxt', 'coverage',
+  '.venv', 'venv', 'env', '__pycache__', '.idea', '.vscode', 'bin', 'obj',
+  'target', 'chroma_data', 'cloned_repos'
+]);
+const MAX_UPLOAD_FILES = 2000;
+
+function isUploadableSource(file) {
+  const relativePath = file.webkitRelativePath || file.name;
+  const parts = relativePath.replace(/\\/g, '/').split('/');
+  const filename = parts.at(-1).toLowerCase();
+  const parentDirectories = parts.slice(0, -1).map((part) => part.toLowerCase());
+  if (parentDirectories.some((directory) => IGNORED_UPLOAD_DIRECTORIES.has(directory) || directory.startsWith('.'))) return false;
+  if (filename === 'dockerfile' || filename === 'makefile') return true;
+  if (filename.endsWith('.min.js') || filename.endsWith('.min.mjs') || filename.endsWith('.map') || filename.endsWith('.lock')) return false;
+  return UPLOADABLE_EXTENSIONS.has(`.${filename.split('.').pop()}`);
+}
+
 export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
   const [repoPath, setRepoPath] = useState(activeRepo || 'https://github.com/vbv0507/RepoSage');
   const [isIngesting, setIsIngesting] = useState(false);
@@ -65,14 +88,26 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     event.target.value = '';
     if (!selectedFiles.length) return;
 
+    // Filter before creating FormData. This prevents node_modules and build
+    // output from reaching the hosted server's multipart file-count guard.
+    const sourceFiles = selectedFiles.filter(isUploadableSource);
+    if (!sourceFiles.length) {
+      setError('No supported source files were found in the selected folder.');
+      return;
+    }
+    if (sourceFiles.length > MAX_UPLOAD_FILES) {
+      setError(`This project has ${sourceFiles.length} supported source files. Upload up to ${MAX_UPLOAD_FILES} files at a time.`);
+      return;
+    }
+
     setIsIngesting(true);
     setError(null);
     setStats(null);
-    setCurrentStep(`Uploading ${selectedFiles.length} files from your selected folder...`);
+    setCurrentStep(`Uploading ${sourceFiles.length} source files; skipped ${selectedFiles.length - sourceFiles.length} generated or unsupported files...`);
 
     try {
       const formData = new FormData();
-      selectedFiles.forEach((file) => {
+      sourceFiles.forEach((file) => {
         formData.append('files', file, file.webkitRelativePath || file.name);
       });
       const response = await fetch(`${API_BASE}/api/upload-repository`, { method: 'POST', body: formData });
