@@ -3,6 +3,7 @@ import re
 import ast
 import json
 import logging
+import fnmatch
 from typing import List, Dict, Any, Set
 
 logger = logging.getLogger("ast_parser")
@@ -35,22 +36,82 @@ def is_ignored_file(filename: str) -> bool:
         '.ico', '.woff', '.woff2', '.ttf', '.eot', '.mp4', '.pdf'
     ])
 
-def scan_directory(repo_path: str, max_files: int = 400) -> List[str]:
-    files = []
-    for root, dirs, filenames in os.walk(repo_path):
-        # Filter ignored dirs in place
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not d.startswith('.')]
+DEFAULT_MAX_SOURCE_FILES = 2000
+MAX_SOURCE_FILE_BYTES = 2 * 1024 * 1024
 
-        for fname in filenames:
+
+def _load_ragignore(repo_path: str) -> List[str]:
+    try:
+        with open(os.path.join(repo_path, '.ragignore'), encoding='utf-8') as ignore_file:
+            return [line.strip().replace('\\', '/') for line in ignore_file if line.strip() and not line.lstrip().startswith('#')]
+    except OSError:
+        return []
+
+
+def _matches_ragignore(relative_path: str, patterns: List[str]) -> bool:
+    path = relative_path.replace('\\', '/').lstrip('./')
+    return any(fnmatch.fnmatch(path, pattern.lstrip('./')) for pattern in patterns)
+
+
+def scan_directory_with_report(repo_path: str, max_files: int = DEFAULT_MAX_SOURCE_FILES) -> tuple[List[str], Dict[str, Any]]:
+    """Discover source files deterministically and record every exclusion.
+
+    The report is deliberately separate from logs: it is returned to the UI so
+    an incomplete index can never masquerade as a complete repository view.
+    """
+    files: List[str] = []
+    patterns = _load_ragignore(repo_path)
+    report: Dict[str, Any] = {
+        "discoveredFiles": [], "skippedFiles": [], "skippedDirectories": [],
+        "limits": {"maxSourceFiles": max_files, "maxSourceFileBytes": MAX_SOURCE_FILE_BYTES},
+        "truncated": False,
+    }
+    for root, dirs, filenames in os.walk(repo_path):
+        dirs.sort()
+        relative_root = os.path.relpath(root, repo_path)
+        retained_dirs = []
+        for directory in dirs:
+            relative_dir = os.path.normpath(os.path.join(relative_root, directory)).replace('\\', '/')
+            if directory in IGNORED_DIRS or directory.startswith('.'):
+                report["skippedDirectories"].append({"path": relative_dir, "reason": "ignored_directory"})
+            elif _matches_ragignore(f"{relative_dir}/", patterns) or _matches_ragignore(relative_dir, patterns):
+                report["skippedDirectories"].append({"path": relative_dir, "reason": "ragignore"})
+            else:
+                retained_dirs.append(directory)
+        dirs[:] = retained_dirs
+
+        for fname in sorted(filenames):
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, repo_path).replace('\\', '/')
+            if _matches_ragignore(rel_path, patterns):
+                report["skippedFiles"].append({"path": rel_path, "reason": "ragignore"})
+                continue
             if is_ignored_file(fname):
+                report["skippedFiles"].append({"path": rel_path, "reason": "ignored_file_type"})
                 continue
             ext = os.path.splitext(fname)[1].lower()
-            if ext in CODE_EXTENSIONS or fname in {'Dockerfile', 'Makefile'}:
-                full_path = os.path.join(root, fname)
-                files.append(full_path)
-                if len(files) >= max_files:
-                    return files
-    return files
+            if ext not in CODE_EXTENSIONS and fname not in {'Dockerfile', 'Makefile'}:
+                continue
+            try:
+                file_size = os.path.getsize(full_path)
+            except OSError as exc:
+                report["skippedFiles"].append({"path": rel_path, "reason": f"stat_error: {exc}"})
+                continue
+            if file_size > MAX_SOURCE_FILE_BYTES:
+                report["skippedFiles"].append({"path": rel_path, "reason": "file_size_limit"})
+                continue
+            if len(files) >= max_files:
+                report["truncated"] = True
+                report["skippedFiles"].append({"path": rel_path, "reason": "source_file_limit"})
+                continue
+            files.append(full_path)
+            report["discoveredFiles"].append(rel_path)
+    return files, report
+
+
+def scan_directory(repo_path: str, max_files: int = DEFAULT_MAX_SOURCE_FILES) -> List[str]:
+    """Backward-compatible file-only discovery API."""
+    return scan_directory_with_report(repo_path, max_files=max_files)[0]
 
 def _chunk_by_lines(content: str, rel_path: str, chunk_size: int = 50, overlap: int = 10) -> List[Dict[str, Any]]:
     lines = content.split('\n')
@@ -75,7 +136,7 @@ def _chunk_by_lines(content: str, rel_path: str, chunk_size: int = 50, overlap: 
         })
     return chunks
 
-def _parse_python_ast(content: str, rel_path: str) -> List[Dict[str, Any]]:
+def _parse_python_ast(content: str, rel_path: str) -> tuple[List[Dict[str, Any]], str | None]:
     chunks = []
     try:
         tree = ast.parse(content)
@@ -98,9 +159,9 @@ def _parse_python_ast(content: str, rel_path: str) -> List[Dict[str, Any]]:
                     "filePath": rel_path,
                     "summary": f"{node_type.capitalize()} `{node.name}`. {docstring[:150]}"
                 })
-    except Exception:
-        pass
-    return chunks
+    except (SyntaxError, ValueError, TypeError) as exc:
+        return [], f"python_ast_error: {exc.msg if isinstance(exc, SyntaxError) else str(exc)}"
+    return chunks, None
 
 def _parse_js_ts_functions(content: str, rel_path: str) -> List[Dict[str, Any]]:
     chunks = []
@@ -141,15 +202,20 @@ def parse_code_file(file_path: str, repo_path: str) -> Dict[str, Any]:
     rel_path = os.path.relpath(file_path, repo_path).replace('\\', '/')
     ext = os.path.splitext(file_path)[1].lower()
 
+    read_error = None
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-    except Exception:
+    except OSError as exc:
         content = ""
+        read_error = str(exc)
 
     chunks = []
+    warnings = []
     if ext == '.py':
-        chunks = _parse_python_ast(content, rel_path)
+        chunks, ast_warning = _parse_python_ast(content, rel_path)
+        if ast_warning:
+            warnings.append(ast_warning)
     elif ext in {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}:
         chunks = _parse_js_ts_functions(content, rel_path)
 
@@ -174,7 +240,9 @@ def parse_code_file(file_path: str, repo_path: str) -> Dict[str, Any]:
         "extension": ext,
         "size": len(content),
         "chunks": chunks,
-        "imports": imports
+        "imports": imports,
+        "parseStatus": "read_error" if read_error else ("fallback" if warnings else "parsed"),
+        "warnings": ([f"read_error: {read_error}"] if read_error else []) + warnings
     }
 
 def build_dependency_graph(parsed_files: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:

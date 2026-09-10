@@ -55,7 +55,8 @@ export default function ChatCopilot({ activeRepo }) {
         cacheType: data.cacheType,
         matchedQuestion: data.matchedQuestion,
         similarity: data.similarity,
-        offlineFallback: data.offlineFallback
+        offlineFallback: data.offlineFallback,
+        offlineNoConfidentAnswer: data.offlineNoConfidentAnswer
       }]);
     } catch (err) {
       setMessages(prev => [...prev, {
@@ -172,7 +173,7 @@ export default function ChatCopilot({ activeRepo }) {
                       alignItems: 'center',
                       gap: '4px'
                     }}>
-                      ⚡ Semantic Cache Hit {msg.similarity ? `(${Math.round(msg.similarity * 100)}% match)` : ''}
+                      ⚡ Close semantic cache match {msg.similarity ? `(${Math.round(msg.similarity * 100)}% match)` : ''}
                       {msg.matchedQuestion && <span style={{ opacity: 0.85 }}>• Similar to: "{msg.matchedQuestion}"</span>}
                     </span>
                   ) : (
@@ -188,6 +189,12 @@ export default function ChatCopilot({ activeRepo }) {
                       ⚡ Exact Cache Hit (Redis)
                     </span>
                   )}
+                </div>
+              )}
+
+              {msg.offlineNoConfidentAnswer && (
+                <div style={{ marginBottom: '10px', padding: '10px', border: '1px solid rgba(245, 158, 11, 0.5)', borderRadius: '5px', backgroundColor: 'rgba(245, 158, 11, 0.12)', color: '#fbbf24', fontWeight: '600' }}>
+                  No low-confidence cache answer was used.
                 </div>
               )}
 

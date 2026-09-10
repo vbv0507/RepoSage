@@ -183,13 +183,21 @@ async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]]) -> dic
 
     # Batch add
     BATCH_SIZE = 50
+    failed_files = []
+    stored_count = 0
     for i in range(0, len(ids), BATCH_SIZE):
         b_ids = ids[i:i + BATCH_SIZE]
         b_docs = documents[i:i + BATCH_SIZE]
         b_metas = metadatas[i:i + BATCH_SIZE]
-        coll.add(ids=b_ids, documents=b_docs, metadatas=b_metas)
+        try:
+            coll.add(ids=b_ids, documents=b_docs, metadatas=b_metas)
+            stored_count += len(b_ids)
+        except Exception as exc:
+            affected_files = sorted({meta["filePath"] for meta in b_metas})
+            logger.error("Failed to embed code batch for %s: %s", affected_files, exc)
+            failed_files.extend({"path": file_path, "reason": f"embedding_error: {exc}"} for file_path in affected_files)
 
-    return {"storedCount": len(chunks)}
+    return {"storedCount": stored_count, "failedFiles": failed_files}
 
 async def store_diff_summaries(repo_path: str, diffs: List[Dict[str, Any]]) -> dict:
     if not diffs:

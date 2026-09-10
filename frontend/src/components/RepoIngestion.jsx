@@ -250,6 +250,39 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
               <span>⚡ Reused existing vector embeddings from ChromaDB (Instant load, zero re-embedding).</span>
             </div>
           )}
+          {stats.ingestionReport && (
+            <details style={{ marginTop: '14px', borderTop: '1px solid var(--border-color)', paddingTop: '12px' }}>
+              <summary style={{ cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '12px' }}>
+                Index coverage report — {stats.ingestionReport.summary?.parsed ?? stats.ingestionReport.parsedFiles?.length ?? 0} parsed, {stats.ingestionReport.summary?.skipped ?? stats.ingestionReport.skippedFiles?.length ?? 0} skipped
+                {stats.ingestionReport.truncated ? ' (FILE LIMIT REACHED)' : ''}
+              </summary>
+              <div style={{ marginTop: '10px', fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                {stats.ingestionReport.truncated && (
+                  <p style={{ color: '#fbbf24', marginBottom: '8px' }}>
+                    Index is incomplete: the {stats.ingestionReport.limits?.maxSourceFiles}-file limit was reached. Results must not be used to conclude a module is absent.
+                  </p>
+                )}
+                <details>
+                  <summary>Parsed source files ({stats.ingestionReport.parsedFiles?.length ?? stats.ingestionReport.discoveredFiles?.length ?? 0})</summary>
+                  <pre style={{ maxHeight: '180px', overflow: 'auto', marginTop: '6px', whiteSpace: 'pre-wrap' }}>{(stats.ingestionReport.parsedFiles || stats.ingestionReport.discoveredFiles || []).join('\n') || 'None'}</pre>
+                </details>
+                <details style={{ marginTop: '6px' }}>
+                  <summary>Skipped files ({stats.ingestionReport.skippedFiles?.length ?? 0})</summary>
+                  <pre style={{ maxHeight: '180px', overflow: 'auto', marginTop: '6px', whiteSpace: 'pre-wrap' }}>{(stats.ingestionReport.skippedFiles || []).map((item) => `${item.path} — ${item.reason}`).join('\n') || 'None'}</pre>
+                </details>
+                <details style={{ marginTop: '6px' }}>
+                  <summary>Skipped directories ({stats.ingestionReport.skippedDirectories?.length ?? 0})</summary>
+                  <pre style={{ maxHeight: '180px', overflow: 'auto', marginTop: '6px', whiteSpace: 'pre-wrap' }}>{(stats.ingestionReport.skippedDirectories || []).map((item) => `${item.path} — ${item.reason}`).join('\n') || 'None'}</pre>
+                </details>
+                {(stats.ingestionReport.fallbackFiles?.length ?? 0) > 0 && (
+                  <details style={{ marginTop: '6px' }}>
+                    <summary>Text-fallback files ({stats.ingestionReport.fallbackFiles.length})</summary>
+                    <pre style={{ maxHeight: '180px', overflow: 'auto', marginTop: '6px', whiteSpace: 'pre-wrap' }}>{stats.ingestionReport.fallbackFiles.map((item) => `${item.path} — ${item.reason}`).join('\n')}</pre>
+                  </details>
+                )}
+              </div>
+            </details>
+          )}
         </>
       )}
     </div>

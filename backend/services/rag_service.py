@@ -6,7 +6,7 @@ import uuid
 from typing import Dict, Any, Callable, Optional
 from git import Repo
 
-from .ast_parser import scan_directory, parse_code_file, build_dependency_graph
+from .ast_parser import scan_directory_with_report, parse_code_file, build_dependency_graph
 from .git_archaeology import analyze_git_archaeology
 from .chroma_service import (
     store_code_chunks, store_diff_summaries, search_codebase, get_repo_vector_stats,
@@ -19,6 +19,8 @@ logger = logging.getLogger("rag_service")
 
 WINDOWS_PATH = re.compile(r"^[a-zA-Z]:[\\\\/]")
 UPLOAD_REPO_PREFIX = "upload://"
+SEMANTIC_CACHE_DIRECT_THRESHOLD = 0.88
+SEMANTIC_CACHE_OFFLINE_THRESHOLD = 0.80
 
 
 def _normalise_windows_path(path: str) -> str:
@@ -148,6 +150,7 @@ async def ingest_codebase(
     if not force_refresh:
         stats = await get_repo_vector_stats(repo_path)
         cached_graph = await cache_service.get(f"graph:{repo_path}")
+        cached_report = await cache_service.get(f"ingestion_report:{repo_path}")
         if stats.get("exists") and stats.get("count", 0) > 0 and cached_graph:
             notify({"step": "cached", "message": f"Repository vectors verified ({stats['count']} chunks). Serving instantly!"})
             notify({"step": "complete", "message": "Repository intelligence ready!"})
@@ -159,7 +162,8 @@ async def ingest_codebase(
                 "filesCount": stats.get("filesCount", 0),
                 "gitDiffsCount": 0,
                 "graphNodesCount": len(cached_graph.get("nodes", [])),
-                "graphLinksCount": len(cached_graph.get("links", []))
+                "graphLinksCount": len(cached_graph.get("links", [])),
+                "ingestionReport": cached_report or {"discoveredFiles": [], "skippedFiles": [], "skippedDirectories": [], "truncated": False}
             }
 
     # Clear existing semantic query cache on fresh/force re-ingestion
@@ -167,7 +171,7 @@ async def ingest_codebase(
 
     # 2. File Discovery
     notify({"step": "scanning", "message": "Scanning directory tree and detecting programming languages..."})
-    file_paths = scan_directory(repo_path)
+    file_paths, ingestion_report = scan_directory_with_report(repo_path)
     if not file_paths:
         raise ValueError(f"No parseable source code files discovered in: {repo_path}")
 
@@ -180,8 +184,14 @@ async def ingest_codebase(
 
     for i, fp in enumerate(file_paths):
         p_file = parse_code_file(fp, repo_path)
-        parsed_files.append(p_file)
-        all_chunks.extend(p_file.get("chunks", []))
+        relative_path = p_file["filePath"]
+        if p_file.get("parseStatus") == "read_error":
+            ingestion_report["skippedFiles"].append({"path": relative_path, "reason": p_file["warnings"][0]})
+        else:
+            parsed_files.append(p_file)
+            all_chunks.extend(p_file.get("chunks", []))
+            if p_file.get("warnings"):
+                ingestion_report.setdefault("fallbackFiles", []).append({"path": relative_path, "reason": "; ".join(p_file["warnings"])})
         if (i + 1) % 10 == 0 or i == len(file_paths) - 1:
             notify({"step": "parsing_progress", "current": i + 1, "total": len(file_paths)})
 
@@ -189,10 +199,28 @@ async def ingest_codebase(
     notify({"step": "graph", "message": "Building architectural dependency graph..."})
     graph = build_dependency_graph(parsed_files)
     await cache_service.set(f"graph:{repo_path}", graph, 86400)
-
+    ingestion_report["parsedFiles"] = [item["filePath"] for item in parsed_files]
+    ingestion_report["filesWithChunks"] = [item["filePath"] for item in parsed_files if item.get("chunks")]
+    ingestion_report["summary"] = {
+        "discovered": len(ingestion_report["discoveredFiles"]),
+        "parsed": len(ingestion_report["parsedFiles"]),
+        "fallback": len(ingestion_report.get("fallbackFiles", [])),
+        "skipped": len(ingestion_report["skippedFiles"]),
+        "skippedDirectories": len(ingestion_report["skippedDirectories"]),
+        "truncated": ingestion_report["truncated"],
+    }
     # 5. Store in ChromaDB reposage_code
     notify({"step": "storing_code", "message": f"Indexing and storing {len(all_chunks)} code blocks into vector database..."})
-    await store_code_chunks(repo_path, all_chunks)
+    storage_result = await store_code_chunks(repo_path, all_chunks)
+    if storage_result.get("failedFiles"):
+        ingestion_report["embeddingFailures"] = storage_result["failedFiles"]
+        ingestion_report["skippedFiles"].extend(storage_result["failedFiles"])
+        ingestion_report["truncated"] = True
+        ingestion_report["summary"]["skipped"] = len(ingestion_report["skippedFiles"])
+        ingestion_report["summary"]["embeddingFailures"] = len(storage_result["failedFiles"])
+        ingestion_report["summary"]["truncated"] = True
+        notify({"step": "warning", "message": f"{len(storage_result['failedFiles'])} source files could not be embedded; see Index coverage report."})
+    await cache_service.set(f"ingestion_report:{repo_path}", ingestion_report, 86400)
 
     # 6. Git Archaeology -> reposage_diffs
     notify({"step": "git_archaeology", "message": "Performing Git Archaeology on recent commits..."})
@@ -209,15 +237,41 @@ async def ingest_codebase(
         "chunksCount": len(all_chunks),
         "gitDiffsCount": len(diffs),
         "graphNodesCount": len(graph.get("nodes", [])),
-        "graphLinksCount": len(graph.get("links", []))
+        "graphLinksCount": len(graph.get("links", [])),
+        "ingestionReport": ingestion_report
     }
+
+
+def _build_coverage_context(report: Optional[Dict[str, Any]]) -> str:
+    """Compact file inventory supplied to the LLM as evidence of what was indexed."""
+    if not report:
+        return "Index completeness metadata is unavailable. Do not make claims about missing files or modules."
+    files = report.get("parsedFiles") or report.get("discoveredFiles") or []
+    modules: Dict[str, list[str]] = {}
+    for file_path in files:
+        directory, _, filename = file_path.rpartition("/")
+        modules.setdefault(directory or ".", []).append(filename)
+    module_lines = []
+    for directory in sorted(modules)[:150]:
+        names = ", ".join(sorted(modules[directory])[:12])
+        suffix = "…" if len(modules[directory]) > 12 else ""
+        module_lines.append(f"- {directory}/: {names}{suffix}")
+    summary = report.get("summary", {})
+    limits = report.get("limits", {})
+    completeness = "INCOMPLETE" if report.get("truncated") else "complete within configured limits"
+    return (
+        f"Index coverage is {completeness}: {summary.get('parsed', len(files))} parsed files, "
+        f"{summary.get('skipped', 0)} skipped files, limit {limits.get('maxSourceFiles', 'unknown')} files.\n"
+        "Indexed module/file inventory:\n" + "\n".join(module_lines)
+    )
 
 async def query_codebase(repo_path: Optional[str], question: str, refresh: bool = False) -> Dict[str, Any]:
     if not question:
         raise ValueError("Question is required.")
 
     # Tier 1: Fast Exact Redis Cache Lookup
-    cache_key = f"query:{repo_path}:{question.strip().lower()}"
+    # Versioned key avoids returning pre-trust-calibration cached answers.
+    cache_key = f"query:v2:{repo_path}:{question.strip().lower()}"
     if not refresh:
         cached = await cache_service.get(cache_key)
         if cached and cached.get("answer") and len(cached["answer"]) > 200:
@@ -225,7 +279,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
             return {**cached, "fromCache": True, "cacheType": "exact_redis"}
 
         # Tier 2: Offline-Ready Semantic Vector Cache (ChromaDB all-MiniLM-L6-v2)
-        semantic_match = await find_semantic_query_match(repo_path, question, threshold=0.85)
+        semantic_match = await find_semantic_query_match(repo_path, question, threshold=SEMANTIC_CACHE_DIRECT_THRESHOLD)
         if semantic_match and semantic_match.get("matched") and semantic_match.get("answer"):
             logger.info(
                 f"[Semantic Cache] ⚡ Returning semantic match ({semantic_match['similarity']*100:.1f}%) "
@@ -255,8 +309,10 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
 
     # 2. Dependency Graph Context
     graph_context = ""
+    coverage_context = ""
     if repo_path:
         cached_graph = await cache_service.get(f"graph:{repo_path}")
+        coverage_context = _build_coverage_context(await cache_service.get(f"ingestion_report:{repo_path}"))
         if cached_graph and cached_graph.get("links"):
             top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
             graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
@@ -286,13 +342,15 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     system_prompt = (
         "You are RepoSage, a Principal Software Architect AI specializing in legacy codebase intelligence and architectural decision tracing.\n\n"
         "Your goal is to answer the developer's question accurately, citing specific files, functions, line numbers, and historical git reasons.\n\n"
-        f"Repository Context:\n{graph_context}"
+        f"Repository Context:\n{graph_context}\n{coverage_context}\n\n"
         f"Retrieved Code Implementations:\n{code_context}\n\n"
         + (f"Retrieved Historical Git Changes (Why it was built this way):\n{diff_context}\n\n" if diff_context else "")
         + f"Developer Question: {question}\n\n"
         "Instructions:\n"
         "- Explain the architectural reason and technical flow.\n"
         "- Reference exact file names and line ranges when discussing code.\n"
+        "- Absence from retrieved snippets is NOT evidence that a component does not exist. Never state that a module/file/component is absent as a fact unless the indexed file inventory directly proves it was excluded and you explain that limitation. If evidence is incomplete, say exactly: 'I found no direct evidence in the currently indexed context; this does not prove the component is absent.'\n"
+        "- When the inventory lists a relevant module but snippets were not retrieved, acknowledge the module exists in the index and avoid inventing its implementation details.\n"
         "- If historical diffs provide context on WHY a decision or change was made, highlight it under a '🏛️ Architectural Decision History' section.\n"
         "- Use clean Markdown format with code snippets where helpful.\n\n"
         "Answer:"
@@ -310,8 +368,8 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     except Exception as llm_error:
         logger.warning(f"[LLM] Cloud LLM unavailable ({llm_error}). Checking offline semantic fallback...")
         # Offline Resilience: Check if we have an approximate semantic match (>= 0.65 similarity)
-        fallback_match = await find_semantic_query_match(repo_path, question, threshold=0.65)
-        if fallback_match and fallback_match.get("answer"):
+        fallback_match = await find_semantic_query_match(repo_path, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
+        if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
             logger.info(f"[Offline Mode] 🛡️ Recovered using offline semantic match: '{fallback_match['matchedQuestion']}'")
             return {
                 "answer": (
@@ -330,10 +388,16 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
                 "diffMatches": diff_matches,
                 "citations": list(set(citations))
             }
-        raise RuntimeError(
-            f"RepoSage is currently offline and unable to reach the cloud LLM, and no semantically similar question "
-            f"has been cached locally yet. (Original error: {llm_error})"
-        )
+        return {
+            "answer": "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question. It will not show a loosely related answer as if it were yours. Please retry when the LLM is available.",
+            "question": question,
+            "fromCache": False,
+            "offlineNoConfidentAnswer": True,
+            "cacheType": "offline_no_confident_match",
+            "codeMatches": code_matches,
+            "diffMatches": diff_matches,
+            "citations": list(set(citations))
+        }
 
     code_meta_list = [
         {
