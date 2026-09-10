@@ -77,7 +77,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     };
 
     eventSource.onerror = () => {
-      setError((previous) => previous || 'The analysis connection closed unexpectedly. Ensure the backend is running and try again.');
+      setError((previous) => previous || 'Could not reach the analysis service. Check the repository URL and try again.');
       eventSource.close();
       setIsIngesting(false);
     };
