@@ -123,7 +123,7 @@ def _safe_uploaded_file_path(filename: str) -> Optional[PurePosixPath]:
 
 @app.get("/api/health")
 async def health_check():
-    chroma = check_chroma_connection()
+    chroma = await asyncio.to_thread(check_chroma_connection)
     redis_status = cache_service.get_status()
     llm = check_config_status()
 

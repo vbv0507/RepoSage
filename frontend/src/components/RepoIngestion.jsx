@@ -77,7 +77,7 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     };
 
     eventSource.onerror = () => {
-      setError((previous) => previous || 'Could not reach the analysis service. Check the repository URL and try again.');
+      setError((previous) => previous || 'Could not reach the analysis service. If the container is waking up from idle (cold start), please wait 15–30 seconds and click Analyze again.');
       eventSource.close();
       setIsIngesting(false);
     };

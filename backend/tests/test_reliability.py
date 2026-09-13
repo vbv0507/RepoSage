@@ -3,6 +3,7 @@ import os
 import time
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 from git import Repo
@@ -718,11 +719,11 @@ class ReliabilityTests(unittest.TestCase):
             test_repo = os.path.abspath(temp_dir).replace("\\", "/")
             chunks = [
                 {
-                    "filePath": f"src/module_{i}.py",
+                    "filePath": f"src/feature_{i}.py",
                     "type": "function",
                     "startLine": 1,
                     "endLine": 10,
-                    "code": f"def handle_feature_{i}():\n    return 'feature_{i}_payload'\n",
+                    "code": f"def handle_feature_{i}():\n    return 'feature {i} result'\n",
                     "summary": f"Implementation for feature {i}"
                 }
                 for i in range(10)
@@ -755,8 +756,8 @@ class ReliabilityTests(unittest.TestCase):
 
                     # 2. Assert zero cross-talk: every query matched ONLY its own specific file & payload
                     for i, top_file, top_code, t_start, t_end in results:
-                        self.assertEqual(top_file, f"src/module_{i}.py", f"Cross-talk detected on worker {i}: got {top_file}")
-                        self.assertIn(f"feature_{i}_payload", top_code, f"Cross-talk in payload for worker {i}")
+                        self.assertEqual(top_file, f"src/feature_{i}.py", f"Cross-talk detected on worker {i}: got {top_file}")
+                        self.assertIn(f"feature {i} result", top_code, f"Cross-talk in payload for worker {i}")
 
                     # 3. Assert execution was concurrent (overlapping time windows)
                     overlapping_pairs = sum(
@@ -773,6 +774,270 @@ class ReliabilityTests(unittest.TestCase):
                 asyncio.run(run_test())
             finally:
                 asyncio.run(chroma_service.clear_repo_vectors(test_repo))
+
+    def test_answer_confidence_levels_high_medium_low(self):
+        """
+        Feature 1 verification test:
+        Assert query_codebase produces:
+        - 'high' confidence when >= 3 code matches have similarity >= 0.80 (distance <= 0.20)
+        - 'medium' confidence for 1-2 matches or loose matches
+        - 'low' confidence for zero matches or signature evidence missing
+        """
+        mock_model = CapturingModel()
+
+        # (a) 4 close matches (distance = 0.1 => similarity = 0.9 >= 0.80)
+        close_matches = [
+            {
+                "type": "code",
+                "content": f"def func_{i}(): pass",
+                "distance": 0.1,
+                "metadata": {"filePath": f"src/file_{i}.py", "type": "function", "startLine": 1, "endLine": 5}
+            }
+            for i in range(4)
+        ]
+        with patch.object(rag_service.cache_service, "get", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service.cache_service, "set", new=AsyncMock(return_value=True)), \
+             patch.object(rag_service, "find_semantic_query_match", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service, "search_codebase", new=AsyncMock(return_value={"codeMatches": close_matches, "diffMatches": []})), \
+             patch.object(rag_service, "get_chat_model", return_value=mock_model), \
+             patch.object(rag_service, "store_query_cache", new=AsyncMock(return_value={"stored": True})):
+            res_high = asyncio.run(rag_service.query_codebase("repo", "Explain the architecture"))
+        self.assertEqual(res_high["confidenceLevel"], "high")
+
+        # (b) 1 loose match (distance = 0.5 => similarity = 0.5 < 0.80)
+        loose_match = [
+            {
+                "type": "code",
+                "content": "def loose(): pass",
+                "distance": 0.5,
+                "metadata": {"filePath": "src/loose.py", "type": "function", "startLine": 1, "endLine": 5}
+            }
+        ]
+        with patch.object(rag_service.cache_service, "get", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service.cache_service, "set", new=AsyncMock(return_value=True)), \
+             patch.object(rag_service, "find_semantic_query_match", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service, "search_codebase", new=AsyncMock(return_value={"codeMatches": loose_match, "diffMatches": []})), \
+             patch.object(rag_service, "get_chat_model", return_value=mock_model), \
+             patch.object(rag_service, "store_query_cache", new=AsyncMock(return_value={"stored": True})):
+            res_med = asyncio.run(rag_service.query_codebase("repo", "Explain the architecture"))
+        self.assertEqual(res_med["confidenceLevel"], "medium")
+
+        # (c) zero matches
+        with patch.object(rag_service.cache_service, "get", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service.cache_service, "set", new=AsyncMock(return_value=True)), \
+             patch.object(rag_service, "find_semantic_query_match", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service, "search_codebase", new=AsyncMock(return_value={"codeMatches": [], "diffMatches": []})), \
+             patch.object(rag_service, "get_chat_model", return_value=mock_model), \
+             patch.object(rag_service, "store_query_cache", new=AsyncMock(return_value={"stored": True})):
+            res_low = asyncio.run(rag_service.query_codebase("repo", "Explain the architecture"))
+        self.assertEqual(res_low["confidenceLevel"], "low")
+
+    def test_conversation_history_endpoints_and_uuid_validation(self):
+        """
+        Feature 2 verification test:
+        1. Reject malformed conversation IDs with HTTP 400.
+        2. Create conversation session tied to repoPath.
+        3. Append user message and assistant message (with confidenceLevel and citations).
+        4. Retrieve conversation history and verify messages, repoPath, and order.
+        5. Verify non-existent valid UUID returns HTTP 404.
+        """
+        client = TestClient(app)
+
+        # 1. Reject malformed conversation IDs
+        bad_get = client.get("/api/conversations/not-a-valid-uuid-12345")
+        self.assertEqual(bad_get.status_code, 400)
+        self.assertIn("Invalid conversation ID", bad_get.json()["detail"])
+
+        bad_post = client.post(
+            "/api/conversations/invalid-id-format/messages",
+            json={"role": "user", "text": "hello"}
+        )
+        self.assertEqual(bad_post.status_code, 400)
+        self.assertIn("Invalid conversation ID", bad_post.json()["detail"])
+
+        # 2. Create conversation session
+        create_resp = client.post("/api/conversations", json={"repoPath": "test-owner/test-repo"})
+        self.assertEqual(create_resp.status_code, 200)
+        create_data = create_resp.json()
+        conv_id = create_data.get("conversationId")
+        self.assertIsNotNone(conv_id)
+        parsed_uuid = uuid.UUID(conv_id)
+        self.assertEqual(str(parsed_uuid), conv_id)
+        self.assertEqual(create_data.get("repoPath"), "test-owner/test-repo")
+
+        # 3. Append user message
+        user_msg = {
+            "role": "user",
+            "text": "How does the cache system work?"
+        }
+        append_user_resp = client.post(f"/api/conversations/{conv_id}/messages", json=user_msg)
+        self.assertEqual(append_user_resp.status_code, 200)
+        self.assertEqual(append_user_resp.json()["messagesCount"], 1)
+
+        # 4. Append assistant message with confidenceLevel and citations
+        assistant_msg = {
+            "role": "assistant",
+            "text": "The cache system uses Redis with a ChromaDB semantic fallback.",
+            "confidenceLevel": "high",
+            "codeCitations": [{"filePath": "services/redis_service.py", "startLine": 1, "endLine": 50}],
+            "fromCache": False
+        }
+        append_asst_resp = client.post(f"/api/conversations/{conv_id}/messages", json=assistant_msg)
+        self.assertEqual(append_asst_resp.status_code, 200)
+        self.assertEqual(append_asst_resp.json()["messagesCount"], 2)
+
+        # 5. Retrieve conversation history
+        get_resp = client.get(f"/api/conversations/{conv_id}")
+        self.assertEqual(get_resp.status_code, 200)
+        history = get_resp.json()
+        self.assertEqual(history["conversationId"], conv_id)
+        self.assertEqual(history["repoPath"], "test-owner/test-repo")
+        self.assertEqual(len(history["messages"]), 2)
+        self.assertEqual(history["messages"][0]["role"], "user")
+        self.assertEqual(history["messages"][0]["text"], "How does the cache system work?")
+        self.assertEqual(history["messages"][1]["role"], "assistant")
+        self.assertEqual(history["messages"][1]["confidenceLevel"], "high")
+        self.assertEqual(history["messages"][1]["codeCitations"][0]["filePath"], "services/redis_service.py")
+
+        # 6. Non-existent valid UUID returns 404
+        unused_uuid = str(uuid.uuid4())
+        not_found_resp = client.get(f"/api/conversations/{unused_uuid}")
+        self.assertEqual(not_found_resp.status_code, 404)
+        self.assertIn("not found or expired", not_found_resp.json()["detail"])
+
+    def test_guided_change_assistant_classification_and_analogous_retrieval(self):
+        """
+        Feature 3 verification test:
+        1. Test _is_task_oriented_question classifier across task vs explanatory queries.
+        2. Test find_analogous_feature against synthetic repo fixture with route + service + frontend
+           and assert graph-tracing finds connected template files.
+        3. Test query_codebase returns guided_steps response shape with steps, basedOn, and citations.
+        """
+        from services.rag_service import (
+            _is_task_oriented_question,
+            find_analogous_feature,
+            _parse_guided_steps
+        )
+
+        # 1. Classifier tests
+        task_queries = [
+            "add a new endpoint for user profile update",
+            "how do I add payment webhooks?",
+            "where do I add a custom middleware?",
+            "implement audit logging",
+            "create a new database migration",
+            "I need to build an invoice export service"
+        ]
+        for tq in task_queries:
+            self.assertTrue(_is_task_oriented_question(tq), f"Expected task-oriented query for: '{tq}'")
+
+        explanatory_queries = [
+            "Explain the system architecture",
+            "Why does the system use ChromaDB?",
+            "What parameters does calculate_tax take?",
+            "How does vector caching work?"
+        ]
+        for eq in explanatory_queries:
+            self.assertFalse(_is_task_oriented_question(eq), f"Expected explanatory query for: '{eq}'")
+
+        # 2. Synthetic repo fixture for analogous feature discovery
+        synthetic_graph = {
+            "links": [
+                {"source": "src/routes/items_router.py", "target": "src/services/items_service.py"},
+                {"source": "src/frontend/ItemsList.jsx", "target": "src/routes/items_router.py"}
+            ]
+        }
+        synthetic_profile_matches = [
+            {"filePath": "src/routes/items_router.py", "reason": "FastAPI APIRouter endpoint definitions"}
+        ]
+        synthetic_code_matches = [
+            {
+                "type": "code",
+                "content": "@router.post('/items')\ndef create_item():\n    return items_service.create()",
+                "distance": 0.12,
+                "metadata": {
+                    "filePath": "src/routes/items_router.py",
+                    "type": "function",
+                    "startLine": 10,
+                    "endLine": 15
+                }
+            },
+            {
+                "type": "code",
+                "content": "def create():\n    return {'status': 'created'}",
+                "distance": 0.15,
+                "metadata": {
+                    "filePath": "src/services/items_service.py",
+                    "type": "function",
+                    "startLine": 20,
+                    "endLine": 25
+                }
+            },
+            {
+                "type": "code",
+                "content": "export function ItemsList() { fetch('/items'); }",
+                "distance": 0.18,
+                "metadata": {
+                    "filePath": "src/frontend/ItemsList.jsx",
+                    "type": "function",
+                    "startLine": 1,
+                    "endLine": 12
+                }
+            }
+        ]
+
+        with patch.object(rag_service, "find_relevant_files", new=AsyncMock(return_value=synthetic_profile_matches)), \
+             patch.object(rag_service.cache_service, "get", new=AsyncMock(return_value=synthetic_graph)), \
+             patch.object(rag_service, "search_codebase", new=AsyncMock(return_value={"codeMatches": synthetic_code_matches, "diffMatches": []})):
+            analogous = asyncio.run(
+                find_analogous_feature("synthetic_repo", "idx_syn", "add a new endpoint for order tracking")
+            )
+
+        self.assertIn("src/routes/items_router.py", analogous["templateFiles"])
+        self.assertIn("src/services/items_service.py", analogous["templateFiles"])
+        self.assertIn("src/frontend/ItemsList.jsx", analogous["templateFiles"])
+        self.assertEqual(len(analogous["codeMatches"]), 3)
+        self.assertTrue(any("src/routes/items_router.py -> src/services/items_service.py" in l for l in analogous["connectedLinks"]))
+
+        # 3. Test step parsing helper
+        sample_llm_output = (
+            "Based on the `src/routes/items_router.py` template, follow these steps:\n"
+            "1. Create `src/routes/orders_router.py` to define the new FastAPI router.\n"
+            "2. Create `src/services/orders_service.py` to implement the order tracking logic.\n"
+            "3. Modify `src/main.py` to include the new router.\n"
+            "4. Update `src/frontend/OrdersList.jsx` to consume the API."
+        )
+        parsed_steps = _parse_guided_steps(sample_llm_output, analogous["templateFiles"])
+        self.assertEqual(len(parsed_steps), 4)
+        self.assertEqual(parsed_steps[0]["step"], 1)
+        self.assertIn("src/routes/orders_router.py", parsed_steps[0]["file"])
+        self.assertEqual(parsed_steps[1]["step"], 2)
+        self.assertIn("src/services/orders_service.py", parsed_steps[1]["file"])
+
+        # 4. Test end-to-end query_codebase with guided change assistant
+        mock_llm_response = MagicMock()
+        mock_llm_response.content = sample_llm_output
+        mock_chat_model = MagicMock()
+        mock_chat_model.ainvoke = AsyncMock(return_value=mock_llm_response)
+
+        with patch.object(rag_service.cache_service, "get", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service.cache_service, "set", new=AsyncMock(return_value=True)), \
+             patch.object(rag_service, "find_semantic_query_match", new=AsyncMock(return_value=None)), \
+             patch.object(rag_service, "find_relevant_files", new=AsyncMock(return_value=synthetic_profile_matches)), \
+             patch.object(rag_service, "search_codebase", new=AsyncMock(return_value={"codeMatches": synthetic_code_matches, "diffMatches": []})), \
+             patch.object(rag_service, "get_chat_model", return_value=mock_chat_model), \
+             patch.object(rag_service, "store_query_cache", new=AsyncMock(return_value={"stored": True})):
+            result = asyncio.run(
+                rag_service.query_codebase("synthetic_repo", "Where do I add a new endpoint for order tracking?")
+            )
+
+        self.assertEqual(result["type"], "guided_steps")
+        self.assertEqual(len(result["steps"]), 4)
+        self.assertEqual(result["basedOn"], ["src/routes/items_router.py", "src/services/items_service.py", "src/frontend/ItemsList.jsx"])
+        self.assertEqual(result["confidenceLevel"], "high")
+        self.assertIn("answer", result)
+        self.assertIn("citations", result)
+        self.assertIn("codeCitations", result)
 
 
 if __name__ == "__main__":
