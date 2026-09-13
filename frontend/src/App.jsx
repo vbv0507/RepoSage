@@ -8,6 +8,7 @@ import { API_BASE } from './config';
 
 export default function App() {
   const [health, setHealth] = useState(null);
+  const [backendReady, setBackendReady] = useState(false);
   const [activeRepo, setActiveRepo] = useState('https://github.com/vbv0507/RepoSage');
   const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'graph' | 'tutorial'
 
@@ -19,13 +20,17 @@ export default function App() {
 
   const fetchHealth = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/health`);
+      const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(25000) });
       if (res.ok) {
         const data = await res.json();
         setHealth(data);
+        setBackendReady(true);
+      } else {
+        setBackendReady(false);
       }
     } catch (e) {
-      console.warn('Backend not responding yet');
+      console.warn('Backend not responding yet:', e.message);
+      setBackendReady(false);
     }
   };
 
@@ -42,6 +47,7 @@ export default function App() {
         <RepoIngestion
           activeRepo={activeRepo}
           onIngestionComplete={handleIngestionComplete}
+          backendReady={backendReady}
         />
 
         {/* Responsive Tab Switcher */}

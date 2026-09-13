@@ -24,13 +24,18 @@ function isUploadableSource(file) {
   return UPLOADABLE_EXTENSIONS.has(`.${filename.split('.').pop()}`);
 }
 
-export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
+export default function RepoIngestion({ onIngestionComplete, activeRepo, backendReady = true }) {
   const [repoPath, setRepoPath] = useState(activeRepo || 'https://github.com/vbv0507/RepoSage');
   const [isIngesting, setIsIngesting] = useState(false);
   const [currentStep, setCurrentStep] = useState('');
   const [stats, setStats] = useState(null);
   const [error, setError] = useState(null);
   const folderInputRef = useRef(null);
+  const retryCountRef = useRef(0);
+  const retryTimerRef = useRef(null);
+  const isRetryRef = useRef(false);
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 10000;
 
   useEffect(() => {
     if (activeRepo) {
@@ -41,6 +46,17 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
   const startIngestion = (force = false, pathOverride = repoPath) => {
     const requestedPath = pathOverride.trim();
     if (!requestedPath) return;
+
+    // Cancel any pending retry timer when starting fresh
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    // Reset retry counter on a fresh (non-retry) invocation
+    if (!isRetryRef.current) {
+      retryCountRef.current = 0;
+    }
+    isRetryRef.current = false;
 
     setIsIngesting(true);
     setError(null);
@@ -77,9 +93,20 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
     };
 
     eventSource.onerror = () => {
-      setError((previous) => previous || 'Could not reach the analysis service. If the container is waking up from idle (cold start), please wait 15–30 seconds and click Analyze again.');
       eventSource.close();
-      setIsIngesting(false);
+      if (retryCountRef.current < MAX_RETRIES) {
+        retryCountRef.current += 1;
+        const attempt = retryCountRef.current;
+        setCurrentStep(`Service waking up — retrying in ${RETRY_DELAY_MS / 1000}s (attempt ${attempt}/${MAX_RETRIES})...`);
+        retryTimerRef.current = setTimeout(() => {
+          isRetryRef.current = true;
+          startIngestion(force, requestedPath);
+        }, RETRY_DELAY_MS);
+      } else {
+        retryCountRef.current = 0;
+        setError('Could not reach the analysis service after 3 attempts. The container may still be waking from idle — please wait 30 seconds and click Analyze again.');
+        setIsIngesting(false);
+      }
     };
   };
 
@@ -170,6 +197,12 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
         </div>
       </div>
 
+      {!backendReady && !isIngesting && (
+        <div style={{ marginBottom: '8px', padding: '6px 12px', backgroundColor: 'rgba(251, 191, 36, 0.1)', border: '1px solid rgba(251, 191, 36, 0.25)', borderRadius: '6px', color: '#fbbf24', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <span>&#9679;</span> Backend service is waking up — Analyze will be available in a few seconds.
+        </div>
+      )}
+
       <div className="ingestion-input-row">
         <input
           type="text"
@@ -182,10 +215,11 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
         <button
           className="btn btn-primary"
           onClick={() => startIngestion(false)}
-          disabled={isIngesting || !repoPath}
+          disabled={isIngesting || !repoPath || !backendReady}
           style={{ flexShrink: 0 }}
+          title={!backendReady ? 'Backend service is waking up, please wait...' : undefined}
         >
-          {isIngesting ? 'Analyzing...' : 'Analyze'}
+          {isIngesting ? 'Analyzing...' : !backendReady ? 'Waking up...' : 'Analyze'}
         </button>
         {stats && (
           <button
