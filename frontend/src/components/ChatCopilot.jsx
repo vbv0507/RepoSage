@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { API_BASE } from '../config';
 
 export default function ChatCopilot({ activeRepo }) {
@@ -12,42 +12,124 @@ export default function ChatCopilot({ activeRepo }) {
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [conversationId, setConversationId] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const conversationIdRef = useRef(null);
 
   const suggestedPrompts = [
+    "Where do I add a new API endpoint?",
     "Explain the end-to-end data flow of this codebase.",
     "Why does this project use both ChromaDB and Redis together?",
     "What modules will be affected if we modify astParser.js?",
     "Show me architectural decisions revealed by Git Archaeology."
   ];
 
-  const handleSend = async (questionText, forceRefresh = false) => {
-    const q = questionText || input;
+  // Helper to persist messages in background without blocking chat UI
+  const persistMessage = (convId, msg) => {
+    if (!convId) return;
+    fetch(`${API_BASE}/api/conversations/${encodeURIComponent(convId)}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg)
+    }).catch(err => {
+      console.warn('[Conversation] Background message persistence failed:', err.message);
+    });
+  };
+
+  // On mount: check for conversation ID in URL (?conversation=... or ?conversationId=...)
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const initialId = urlParams.get('conversation') || urlParams.get('conversationId');
+    if (initialId) {
+      setConversationId(initialId);
+      conversationIdRef.current = initialId;
+      fetch(`${API_BASE}/api/conversations/${encodeURIComponent(initialId)}`)
+        .then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json();
+        })
+        .then(data => {
+          if (data && Array.isArray(data.messages) && data.messages.length > 0) {
+            setMessages(data.messages);
+          }
+        })
+        .catch(err => {
+          console.warn('[Conversation] Failed to restore conversation from URL:', err);
+        });
+    }
+  }, []);
+
+  const handleCopyShareLink = () => {
+    const currentId = conversationIdRef.current || conversationId;
+    if (!currentId) return;
+    const shareUrl = `${window.location.origin}${window.location.pathname}?conversation=${encodeURIComponent(currentId)}`;
+    navigator.clipboard.writeText(shareUrl).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(err => {
+      console.warn('Clipboard write failed:', err);
+    });
+  };
+
+  const handleSend = async (overridePrompt) => {
+    const q = overridePrompt || input;
     if (!q.trim() || loading) return;
 
-    setInput('');
+    // Reset input immediately
+    if (!overridePrompt) setInput('');
+
+    // If this is the start of a thread and no conversationId exists, initialize one
+    let currentConvId = conversationIdRef.current;
+    if (!currentConvId) {
+      try {
+        const createRes = await fetch(`${API_BASE}/api/conversations`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ repoPath: activeRepo })
+        });
+        if (createRes.ok) {
+          const createData = await createRes.json();
+          currentConvId = createData.conversationId;
+          setConversationId(currentConvId);
+          conversationIdRef.current = currentConvId;
+          const newUrl = `${window.location.pathname}?conversation=${encodeURIComponent(currentConvId)}`;
+          window.history.pushState({ path: newUrl }, '', newUrl);
+        }
+      } catch (convErr) {
+        console.warn('[Conversation] Could not initialize conversation on backend:', convErr);
+      }
+    }
+
     const userMsg = { role: 'user', text: q };
     setMessages(prev => [...prev, userMsg]);
+    if (currentConvId) {
+      persistMessage(currentConvId, userMsg);
+    }
     setLoading(true);
 
-    let accumulatedText = '';
-    const assistantPlaceholder = {
-      role: 'assistant',
-      text: '',
-      codeCitations: [],
-      gitCitations: [],
-      fromCache: false,
-      semanticCache: false,
-      cacheType: null,
-      matchedQuestion: null,
-      similarity: null,
-      offlineFallback: false,
-      offlineNoConfidentAnswer: false
-    };
+    const forceRefresh = q.toLowerCase().includes('refresh cache') || q.toLowerCase().includes('re-index');
 
-    setMessages(prev => [...prev, assistantPlaceholder]);
+    // Add empty assistant message placeholder for streaming
+    setMessages(prev => [
+      ...prev,
+      {
+        role: 'assistant',
+        text: '',
+        codeCitations: [],
+        gitCitations: [],
+        fromCache: false,
+        semanticCache: false,
+        cacheType: null,
+        confidenceLevel: null,
+        responseType: null,
+        steps: [],
+        basedOn: []
+      }
+    ]);
 
     try {
-      const res = await fetch(`${API_BASE}/api/chat-stream`, {
+      // Connect to SSE streaming endpoint
+      const response = await fetch(`${API_BASE}/api/chat-stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -57,28 +139,31 @@ export default function ChatCopilot({ activeRepo }) {
         })
       });
 
-      if (!res.ok || !res.body) {
-        throw new Error(`Streaming failed with status ${res.status}`);
+      if (!response.ok) {
+        throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
       }
 
-      const reader = res.body.getReader();
+      const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
       let buffer = '';
+      let accumulatedText = '';
 
       while (true) {
-        const { value, done } = await reader.read();
+        const { done, value } = await reader.read();
         if (done) break;
+
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        buffer = lines.pop(); // Keep partial line in buffer
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) continue;
-          const jsonStr = trimmed.slice(5).trim();
+          if (!line.startsWith('data: ')) continue;
+          const jsonStr = line.slice(6).trim();
           if (!jsonStr) continue;
+
           try {
             const data = JSON.parse(jsonStr);
+
             if (data.type === 'meta') {
               setMessages(prev => {
                 const next = [...prev];
@@ -90,6 +175,10 @@ export default function ChatCopilot({ activeRepo }) {
                 last.cacheType = data.cacheType;
                 last.matchedQuestion = data.matchedQuestion;
                 last.similarity = data.similarity;
+                if (data.confidenceLevel) last.confidenceLevel = data.confidenceLevel;
+                if (data.responseType) last.responseType = data.responseType;
+                if (data.basedOn) last.basedOn = data.basedOn;
+                if (data.steps) last.steps = data.steps;
                 last.offlineFallback = Boolean(data.offlineFallback);
                 last.offlineNoConfidentAnswer = Boolean(data.offlineNoConfidentAnswer);
                 next[next.length - 1] = last;
@@ -105,6 +194,7 @@ export default function ChatCopilot({ activeRepo }) {
                 return next;
               });
             } else if (data.type === 'done') {
+              let finalAssistantMsg = null;
               setMessages(prev => {
                 const next = [...prev];
                 const last = { ...next[next.length - 1] };
@@ -116,11 +206,19 @@ export default function ChatCopilot({ activeRepo }) {
                 if (data.cacheType !== undefined) last.cacheType = data.cacheType;
                 if (data.matchedQuestion !== undefined) last.matchedQuestion = data.matchedQuestion;
                 if (data.similarity !== undefined) last.similarity = data.similarity;
-                if (data.offlineFallback !== undefined) last.offlineFallback = data.offlineFallback;
-                if (data.offlineNoConfidentAnswer !== undefined) last.offlineNoConfidentAnswer = data.offlineNoConfidentAnswer;
+                if (data.confidenceLevel !== undefined) last.confidenceLevel = data.confidenceLevel;
+                if (data.type === 'guided_steps' || data.responseType === 'guided_steps') last.responseType = 'guided_steps';
+                if (data.steps) last.steps = data.steps;
+                if (data.basedOn) last.basedOn = data.basedOn;
+                last.offlineFallback = Boolean(data.offlineFallback);
+                last.offlineNoConfidentAnswer = Boolean(data.offlineNoConfidentAnswer);
                 next[next.length - 1] = last;
+                finalAssistantMsg = last;
                 return next;
               });
+              if (finalAssistantMsg && currentConvId) {
+                persistMessage(currentConvId, finalAssistantMsg);
+              }
             } else if (data.type === 'error') {
               throw new Error(data.error || 'Streaming error');
             }
@@ -144,29 +242,37 @@ export default function ChatCopilot({ activeRepo }) {
         });
         if (!fallbackRes.ok) throw new Error(`Server returned HTTP ${fallbackRes.status}`);
         const data = await fallbackRes.json();
+        const fallbackAssistant = {
+          role: 'assistant',
+          text: data.answer,
+          responseType: data.type || (data.steps ? 'guided_steps' : 'chat'),
+          steps: data.steps || [],
+          basedOn: data.basedOn || [],
+          codeCitations: data.codeCitations || [],
+          gitCitations: data.gitCitations || [],
+          fromCache: data.fromCache,
+          semanticCache: data.semanticCache,
+          cacheType: data.cacheType,
+          matchedQuestion: data.matchedQuestion,
+          similarity: data.similarity,
+          confidenceLevel: data.confidenceLevel || null,
+          offlineFallback: data.offlineFallback,
+          offlineNoConfidentAnswer: data.offlineNoConfidentAnswer
+        };
         setMessages(prev => {
           const next = [...prev];
-          next[next.length - 1] = {
-            role: 'assistant',
-            text: data.answer,
-            codeCitations: data.codeCitations || [],
-            gitCitations: data.gitCitations || [],
-            fromCache: data.fromCache,
-            semanticCache: data.semanticCache,
-            cacheType: data.cacheType,
-            matchedQuestion: data.matchedQuestion,
-            similarity: data.similarity,
-            offlineFallback: data.offlineFallback,
-            offlineNoConfidentAnswer: data.offlineNoConfidentAnswer
-          };
+          next[next.length - 1] = fallbackAssistant;
           return next;
         });
+        if (currentConvId) {
+          persistMessage(currentConvId, fallbackAssistant);
+        }
       } catch (fallbackErr) {
         setMessages(prev => {
           const next = [...prev];
           next[next.length - 1] = {
             role: 'assistant',
-            text: `Error querying codebase: ${fallbackErr.message}. Please ensure the backend and vector DB are active.`,
+            text: `Error connecting to RepoSage backend: ${fallbackErr.message}. Ensure backend is running.`,
             codeCitations: [],
             gitCitations: []
           };
@@ -221,9 +327,21 @@ export default function ChatCopilot({ activeRepo }) {
     <div className="card chat-container">
       {/* Header & Quick Prompts */}
       <div style={{ borderBottom: '1px solid var(--border-color)' }}>
-        <div style={{ padding: '12px 16px 8px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '6px' }}>
-          <span style={{ fontSize: '14px', fontWeight: '600' }}>Copilot Chat</span>
-          <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>AST + Git Archaeology Grounded</span>
+        <div style={{ padding: '12px 16px 8px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '14px', fontWeight: '600' }}>Copilot Chat</span>
+            <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>AST + Git Archaeology Grounded</span>
+          </div>
+          {conversationId && (
+            <button
+              onClick={handleCopyShareLink}
+              className="btn btn-secondary"
+              style={{ fontSize: '11.5px', padding: '4px 10px', height: '26px' }}
+              title="Copy shareable URL for this conversation"
+            >
+              {copied ? '✓ Link Copied' : '🔗 Copy share link'}
+            </button>
+          )}
         </div>
 
         <div className="chat-prompts-bar">
@@ -267,14 +385,30 @@ export default function ChatCopilot({ activeRepo }) {
               color: 'var(--text-primary)',
               lineHeight: 1.6
             }}>
-              {msg.fromCache && (
+              {(msg.fromCache || msg.confidenceLevel) && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
-                  {msg.semanticCache ? (
+                  {msg.confidenceLevel && (
                     <span style={{
                       fontSize: '11px',
-                      backgroundColor: msg.offlineFallback ? 'rgba(245, 158, 11, 0.15)' : 'rgba(59, 130, 246, 0.15)',
-                      border: `1px solid ${msg.offlineFallback ? 'rgba(245, 158, 11, 0.35)' : 'rgba(59, 130, 246, 0.35)'}`,
-                      color: msg.offlineFallback ? '#fbbf24' : '#60a5fa',
+                      backgroundColor:
+                        msg.confidenceLevel === 'high'
+                          ? 'rgba(16, 185, 129, 0.15)'
+                          : msg.confidenceLevel === 'medium'
+                          ? 'rgba(245, 158, 11, 0.15)'
+                          : 'rgba(239, 68, 68, 0.15)',
+                      border: `1px solid ${
+                        msg.confidenceLevel === 'high'
+                          ? 'rgba(16, 185, 129, 0.35)'
+                          : msg.confidenceLevel === 'medium'
+                          ? 'rgba(245, 158, 11, 0.35)'
+                          : 'rgba(239, 68, 68, 0.35)'
+                      }`,
+                      color:
+                        msg.confidenceLevel === 'high'
+                          ? 'var(--success-color)'
+                          : msg.confidenceLevel === 'medium'
+                          ? 'var(--warning-color)'
+                          : 'var(--danger-color)',
                       padding: '2px 8px',
                       borderRadius: '12px',
                       fontWeight: '500',
@@ -282,21 +416,40 @@ export default function ChatCopilot({ activeRepo }) {
                       alignItems: 'center',
                       gap: '4px'
                     }}>
-                      ⚡ Close semantic cache match {msg.similarity ? `(${Math.round(msg.similarity * 100)}% match)` : ''}
-                      {msg.matchedQuestion && <span style={{ opacity: 0.85 }}>• Similar to: "{msg.matchedQuestion}"</span>}
+                      <span>{msg.confidenceLevel === 'high' ? '●' : msg.confidenceLevel === 'medium' ? '◐' : '○'}</span>
+                      {msg.confidenceLevel === 'high' ? 'High Confidence' : msg.confidenceLevel === 'medium' ? 'Medium Confidence' : 'Low Confidence'}
                     </span>
-                  ) : (
-                    <span style={{
-                      fontSize: '11px',
-                      backgroundColor: 'rgba(34, 197, 94, 0.15)',
-                      border: '1px solid rgba(34, 197, 94, 0.3)',
-                      color: '#4ade80',
-                      padding: '2px 8px',
-                      borderRadius: '12px',
-                      fontWeight: '500'
-                    }}>
-                      ⚡ Exact Cache Hit (Redis)
-                    </span>
+                  )}
+                  {msg.fromCache && (
+                    msg.semanticCache ? (
+                      <span style={{
+                        fontSize: '11px',
+                        backgroundColor: msg.offlineFallback ? 'rgba(245, 158, 11, 0.15)' : 'rgba(59, 130, 246, 0.15)',
+                        border: `1px solid ${msg.offlineFallback ? 'rgba(245, 158, 11, 0.35)' : 'rgba(59, 130, 246, 0.35)'}`,
+                        color: msg.offlineFallback ? '#fbbf24' : '#60a5fa',
+                        padding: '2px 8px',
+                        borderRadius: '12px',
+                        fontWeight: '500',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '4px'
+                      }}>
+                        ⚡ Close semantic cache match {msg.similarity ? `(${Math.round(msg.similarity * 100)}% match)` : ''}
+                        {msg.matchedQuestion && <span style={{ opacity: 0.85 }}>• Similar to: "{msg.matchedQuestion}"</span>}
+                      </span>
+                    ) : (
+                      <span style={{
+                        fontSize: '11px',
+                        backgroundColor: 'rgba(34, 197, 94, 0.15)',
+                        border: '1px solid rgba(34, 197, 94, 0.3)',
+                        color: '#4ade80',
+                        padding: '2px 8px',
+                        borderRadius: '12px',
+                        fontWeight: '500'
+                      }}>
+                        ⚡ Exact Cache Hit (Redis)
+                      </span>
+                    )
                   )}
                 </div>
               )}
@@ -307,7 +460,105 @@ export default function ChatCopilot({ activeRepo }) {
                 </div>
               )}
 
-              <div dangerouslySetInnerHTML={{ __html: formatText(msg.text) }} />
+              {/* Message Body: either Guided Steps Checklist or Prose Answer */}
+              {(msg.responseType === 'guided_steps' || (msg.steps && msg.steps.length > 0)) ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '8px 12px',
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    border: '1px solid rgba(59, 130, 246, 0.25)',
+                    borderRadius: '6px',
+                    color: '#60a5fa',
+                    fontSize: '13px',
+                    fontWeight: '600'
+                  }}>
+                    <span>🛠️ Guided Change Checklist</span>
+                    <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: '400', marginLeft: 'auto' }}>
+                      Grounded in codebase template patterns
+                    </span>
+                  </div>
+
+                  {msg.steps && msg.steps.length > 0 ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      {msg.steps.map((st, si) => (
+                        <div
+                          key={si}
+                          style={{
+                            display: 'flex',
+                            gap: '12px',
+                            padding: '10px 14px',
+                            backgroundColor: '#121215',
+                            border: '1px solid var(--border-color)',
+                            borderRadius: '6px',
+                            fontSize: '13px'
+                          }}
+                        >
+                          <div style={{
+                            minWidth: '24px',
+                            height: '24px',
+                            borderRadius: '50%',
+                            backgroundColor: '#27272a',
+                            border: '1px solid #3f3f46',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '11.5px',
+                            fontWeight: '700',
+                            color: 'var(--text-primary)'
+                          }}>
+                            {st.step || si + 1}
+                          </div>
+                          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                            {st.file && (
+                              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '11.5px', fontFamily: 'monospace', color: '#60a5fa' }}>
+                                <span>📄</span>
+                                <code>{st.file}</code>
+                              </div>
+                            )}
+                            <div style={{ color: 'var(--text-primary)', lineHeight: 1.5 }}>
+                              {st.text}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div dangerouslySetInnerHTML={{ __html: formatText(msg.text) }} />
+                  )}
+
+                  {/* Based-On Template Citations */}
+                  {msg.basedOn && msg.basedOn.length > 0 && (
+                    <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid var(--border-color)' }}>
+                      <div style={{ fontSize: '11.5px', fontWeight: '600', color: 'var(--text-secondary)', marginBottom: '6px' }}>
+                        Analogous Feature Template (Based On):
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                        {msg.basedOn.map((bFile, bi) => (
+                          <span
+                            key={bi}
+                            style={{
+                              backgroundColor: '#18181b',
+                              border: '1px solid #27272a',
+                              padding: '3px 8px',
+                              borderRadius: '4px',
+                              fontSize: '11.5px',
+                              fontFamily: 'monospace',
+                              color: '#a1a1aa'
+                            }}
+                          >
+                            📐 {bFile}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div dangerouslySetInnerHTML={{ __html: formatText(msg.text) }} />
+              )}
 
               {/* Code Citations */}
               {msg.codeCitations && msg.codeCitations.length > 0 && (

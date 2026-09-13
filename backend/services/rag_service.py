@@ -26,6 +26,42 @@ WINDOWS_PATH = re.compile(r"^[a-zA-Z]:[\\\\/]")
 UPLOAD_REPO_PREFIX = "upload://"
 SEMANTIC_CACHE_DIRECT_THRESHOLD = 0.88
 SEMANTIC_CACHE_OFFLINE_THRESHOLD = 0.80
+CONFIDENCE_HIGH_SIMILARITY_THRESHOLD = 0.80
+
+
+def compute_confidence_level(
+    code_matches: Optional[List[Dict[str, Any]]] = None,
+    signature_evidence_missing: bool = False,
+    offline_no_confident_answer: bool = False,
+    threshold: float = CONFIDENCE_HIGH_SIMILARITY_THRESHOLD,
+    min_close_matches: int = 3
+) -> str:
+    """
+    Computes answer confidence level: 'high', 'medium', or 'low'.
+    - 'high': at least min_close_matches (3) with similarity (1 - distance) >= threshold (0.80).
+    - 'medium': 1-2 matches, or matches present but similarity below high cutoff.
+    - 'low': 0 matches, or signature-evidence-missing, or offline-no-confident-answer.
+    """
+    if signature_evidence_missing or offline_no_confident_answer:
+        return "low"
+    if not code_matches:
+        return "low"
+
+    close_matches = 0
+    for match in code_matches:
+        dist = match.get("distance")
+        if dist is not None:
+            try:
+                sim = max(0.0, 1.0 - float(dist))
+                if sim >= threshold:
+                    close_matches += 1
+            except (ValueError, TypeError):
+                pass
+
+    if close_matches >= min_close_matches:
+        return "high"
+
+    return "medium"
 
 
 def _normalise_windows_path(path: str) -> str:
@@ -441,6 +477,175 @@ def _build_semantic_cache_scope(repo_path: Optional[str], index_id: Optional[str
     return repo_path or "global"
 
 
+TASK_ORIENTED_PATTERN = re.compile(
+    r"\b("
+    r"how\s+(do|can)\s+i\s+(add|create|implement|build|wire)|"
+    r"where\s+(do|can)\s+i\s+(add|create|implement|put|wire)|"
+    r"where\s+to\s+(add|create|implement|put)|"
+    r"i\s+(need|want)\s+to\s+(add|create|implement|build)|"
+    r"add\s+a\s+new|"
+    r"create\s+a(\s+new)?|"
+    r"implement|"
+    r"steps\s+to\s+(add|create|implement|build)"
+    r")\b",
+    re.IGNORECASE
+)
+
+
+def _is_task_oriented_question(question: str) -> bool:
+    """Classify whether a developer query is asking for change steps/where to add a feature.
+
+    NOTE: Lightweight keyword/regex classifier used to avoid an extra LLM round-trip latency.
+    May misclassify ambiguous conversational queries.
+    """
+    if not question:
+        return False
+    return bool(TASK_ORIENTED_PATTERN.search(question.strip()))
+
+
+async def find_analogous_feature(
+    repo_path: Optional[str],
+    index_id: Optional[str],
+    question: str
+) -> Dict[str, Any]:
+    """
+    Locates an analogous existing feature matching the task's shape:
+    1. Uses file-profile routing (find_relevant_files) to locate candidate files.
+    2. Traces dependency graph edges to find connected route/service/frontend files.
+    3. Retrieves code chunks for the identified template files using search_codebase focused-file retrieval.
+    """
+    candidate_files: List[str] = []
+
+    # 1. Profile routing for matching shape (e.g. endpoint, route, handler)
+    if repo_path and index_id:
+        try:
+            profile_matches = await find_relevant_files(repo_path, index_id, question, top_k=3)
+            candidate_files = [m["filePath"] for m in profile_matches if m.get("filePath")]
+        except Exception as exc:
+            logger.warning(f"[Guided Change] Profile routing error: {exc}")
+
+    # Fallback to code search if no profile candidates
+    if not candidate_files:
+        try:
+            search_res = await search_codebase(repo_path=repo_path, question=question, top_k=4, index_id=index_id)
+            candidate_files = list(dict.fromkeys(
+                m["metadata"]["filePath"]
+                for m in search_res.get("codeMatches", [])
+                if m.get("metadata", {}).get("filePath")
+            ))
+        except Exception as exc:
+            logger.warning(f"[Guided Change] Fallback code search error: {exc}")
+
+    # 2. Dependency Graph Tracing
+    connected_files: List[str] = []
+    connected_links: List[str] = []
+
+    if repo_path:
+        cached_graph = await cache_service.get(f"graph:{repo_path}")
+        if cached_graph and cached_graph.get("links"):
+            links = cached_graph["links"]
+            for cand in candidate_files:
+                if cand not in connected_files:
+                    connected_files.append(cand)
+                # Outgoing & incoming connections
+                for link in links:
+                    src = link.get("source")
+                    tgt = link.get("target")
+                    if src == cand and tgt and tgt not in connected_files:
+                        connected_files.append(tgt)
+                        connected_links.append(f"{src} -> {tgt}")
+                    elif tgt == cand and src and src not in connected_files:
+                        connected_files.append(src)
+                        connected_links.append(f"{src} -> {tgt}")
+
+    template_files = connected_files[:4] if connected_files else candidate_files[:3]
+
+    # 3. Retrieve focused code chunks for template files
+    matches = await search_codebase(
+        repo_path=repo_path,
+        question=question,
+        top_k=5,
+        index_id=index_id,
+        file_path_hints=template_files if template_files else None
+    )
+
+    return {
+        "templateFiles": template_files,
+        "codeMatches": matches.get("codeMatches", []),
+        "diffMatches": matches.get("diffMatches", []),
+        "connectedLinks": connected_links
+    }
+
+
+def _parse_guided_steps(text: str, template_files: List[str]) -> List[Dict[str, Any]]:
+    """Parse ordered checklist steps from LLM response."""
+    steps = []
+    lines = text.split("\n")
+    current_step = None
+
+    for line in lines:
+        stripped = line.strip()
+        num_match = re.match(r"^(\d+)[\.\)]\s+(.*)", stripped)
+        if num_match:
+            if current_step:
+                steps.append(current_step)
+            step_num = int(num_match.group(1))
+            step_body = num_match.group(2)
+
+            file_match = re.search(r"[`\*]*([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)[`\*]*", step_body)
+            file_hint = file_match.group(1) if file_match else ""
+
+            current_step = {
+                "step": step_num,
+                "text": step_body,
+                "file": file_hint
+            }
+        elif current_step and stripped and not stripped.startswith("#"):
+            current_step["text"] += " " + stripped
+
+    if current_step:
+        steps.append(current_step)
+
+    if not steps and template_files:
+        for i, tf in enumerate(template_files, 1):
+            steps.append({
+                "step": i,
+                "text": f"Create or modify feature module corresponding to template: {tf}",
+                "file": tf
+            })
+
+    return steps
+
+
+def _build_guided_change_prompt(
+    question: str,
+    template_files: List[str],
+    connected_links: List[str],
+    code_context: str,
+    graph_context: str,
+    coverage_context: str
+) -> str:
+    template_str = ", ".join(f"`{f}`" for f in template_files) if template_files else "none found"
+    links_str = "\n".join(connected_links) if connected_links else "no explicit link traced"
+    return (
+        "You are RepoSage, a Principal Software Architect AI specializing in legacy codebase intelligence and guided code changes.\n\n"
+        "The developer has asked a task-oriented question about adding, implementing, or creating a feature.\n"
+        "Your task is to provide an ordered, numbered checklist of files to create or modify, grounded strictly in an analogous existing feature found in this codebase.\n\n"
+        f"Analogous Template Files Identified: {template_str}\n"
+        f"Template Component Graph Connections:\n{links_str}\n\n"
+        f"Repository Context:\n{graph_context}\n{coverage_context}\n\n"
+        f"Retrieved Code Implementations from Template:\n{code_context}\n\n"
+        f"Developer Request: {question}\n\n"
+        "Strict Instructions:\n"
+        "- If no good analogous template feature was found or retrieved code is empty, explicitly state: 'No confident analogous feature template found in currently indexed context; cannot ground guided change steps without inventing unverified structure.' Do NOT invent a plausible-sounding checklist.\n"
+        "- Output an ordered, numbered list (e.g. 1. Create/Modify `path/to/file` - purpose and what to model after the template).\n"
+        "- For each step, state the exact file path or proposed file path and explain how it mirrors the template pattern.\n"
+        "- Do not state absence as fact. Do not invent non-existent APIs or libraries.\n"
+        "- Ground every file change in the retrieved code blocks and architecture links above.\n\n"
+        "Guided Change Checklist:"
+    )
+
+
 async def query_codebase(repo_path: Optional[str], question: str, refresh: bool = False) -> Dict[str, Any]:
     if not question:
         raise ValueError("Question is required.")
@@ -454,7 +659,12 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         cached = await cache_service.get(cache_key)
         if cached and cached.get("answer"):
             logger.info(f"[Cache] ⚡ Returning exact match from Redis for: '{question}'")
-            return {**cached, "fromCache": True, "cacheType": "exact_redis"}
+            return {
+                **cached,
+                "fromCache": True,
+                "cacheType": "exact_redis",
+                "confidenceLevel": cached.get("confidenceLevel", "high")
+            }
 
         # Tier 2: Offline-Ready Semantic Vector Cache (ChromaDB all-MiniLM-L6-v2)
         semantic_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_DIRECT_THRESHOLD)
@@ -468,6 +678,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
                 "question": question,
                 "matchedQuestion": semantic_match["matchedQuestion"],
                 "similarity": semantic_match["similarity"],
+                "confidenceLevel": semantic_match.get("confidenceLevel", "high"),
                 "fromCache": True,
                 "semanticCache": True,
                 "cacheType": "semantic_chromadb",
@@ -480,6 +691,133 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
                 ]
             }
 
+    # Guided Change Assistant path for task-oriented questions
+    if _is_task_oriented_question(question):
+        analogous = await find_analogous_feature(repo_path, index_id, question)
+        template_files = analogous.get("templateFiles", [])
+        code_matches = analogous.get("codeMatches", [])
+        diff_matches = analogous.get("diffMatches", [])
+        connected_links = analogous.get("connectedLinks", [])
+        confidence_level = compute_confidence_level(code_matches)
+
+        graph_context = ""
+        coverage_context = ""
+        if repo_path:
+            cached_graph = await cache_service.get(f"graph:{repo_path}")
+            coverage_context = _build_coverage_context(report)
+            if cached_graph and cached_graph.get("links"):
+                top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
+                graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
+
+        code_blocks_str = []
+        citations = []
+        for i, c in enumerate(code_matches):
+            meta = c.get("metadata", {})
+            fp = meta.get("filePath", "unknown")
+            s = meta.get("startLine", 1)
+            e = meta.get("endLine", 1)
+            citations.append(f"{fp}:{s}-{e}")
+            code_blocks_str.append(f"[Code Block {i+1}] File: {fp} (Lines {s}-{e}):\n```\n{c.get('content')}\n```")
+
+        code_context = "\n\n".join(code_blocks_str)
+
+        code_meta_list = [
+            {
+                "filePath": c.get("metadata", {}).get("filePath"),
+                "name": c.get("metadata", {}).get("name"),
+                "startLine": c.get("metadata", {}).get("startLine"),
+                "endLine": c.get("metadata", {}).get("endLine"),
+                "snippet": (c.get("content") or "")[:300]
+            }
+            for c in code_matches
+        ]
+        git_meta_list = [
+            {
+                "hash": d.get("metadata", {}).get("hash"),
+                "author": d.get("metadata", {}).get("author"),
+                "date": d.get("metadata", {}).get("date"),
+                "summary": (d.get("content") or "")[:200]
+            }
+            for d in diff_matches
+        ]
+
+        system_prompt = _build_guided_change_prompt(
+            question=question,
+            template_files=template_files,
+            connected_links=connected_links,
+            code_context=code_context,
+            graph_context=graph_context,
+            coverage_context=coverage_context
+        )
+
+        try:
+            chat_model = get_chat_model(temperature=0.2)
+            response = await chat_model.ainvoke(system_prompt)
+            if isinstance(response.content, str):
+                answer_text = response.content
+            elif isinstance(response.content, list):
+                answer_text = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in response.content)
+            else:
+                answer_text = str(response.content)
+        except Exception as llm_error:
+            logger.warning(f"[Guided Change] LLM unavailable ({llm_error}). Checking offline semantic fallback...")
+            fallback_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
+            if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
+                return {
+                    "type": "guided_steps",
+                    "steps": fallback_match.get("steps", []),
+                    "basedOn": fallback_match.get("basedOn", template_files),
+                    "answer": fallback_match["answer"],
+                    "question": question,
+                    "confidenceLevel": fallback_match.get("confidenceLevel", "medium"),
+                    "fromCache": True,
+                    "semanticCache": True,
+                    "offlineFallback": True,
+                    "cacheType": "offline_semantic_fallback",
+                    "codeMatches": code_matches,
+                    "diffMatches": diff_matches,
+                    "citations": list(set(citations))
+                }
+            return {
+                "type": "guided_steps",
+                "steps": [],
+                "basedOn": template_files,
+                "answer": "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question.",
+                "question": question,
+                "fromCache": False,
+                "offlineNoConfidentAnswer": True,
+                "confidenceLevel": "low",
+                "codeMatches": code_matches,
+                "diffMatches": diff_matches,
+                "citations": list(set(citations))
+            }
+
+        steps = _parse_guided_steps(answer_text, template_files)
+
+        result = {
+            "type": "guided_steps",
+            "steps": steps,
+            "basedOn": template_files,
+            "answer": answer_text,
+            "question": question,
+            "confidenceLevel": confidence_level,
+            "codeMatches": code_matches,
+            "diffMatches": diff_matches,
+            "codeCitations": code_meta_list,
+            "gitCitations": git_meta_list,
+            "citations": list(set(citations))
+        }
+
+        await cache_service.set(cache_key, result, 86400)
+        await store_query_cache(
+            repo_path=semantic_scope,
+            question=question,
+            answer=answer_text,
+            code_citations=code_meta_list,
+            git_citations=git_meta_list
+        )
+        return result
+
     # 1. Dual-Vector Search (Current Code + Historical Diffs)
     file_path_hint = _file_hint(question, report)
     profile_matches = [] if file_path_hint or not (repo_path and index_id) else await find_relevant_files(repo_path, index_id, question)
@@ -487,6 +825,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     matches = await search_codebase(repo_path=repo_path, question=question, top_k=5, index_id=index_id, file_path_hint=file_path_hint, file_path_hints=profile_hints)
     code_matches = matches.get("codeMatches", [])
     diff_matches = matches.get("diffMatches", [])
+    confidence_level = compute_confidence_level(code_matches)
 
     # 2. Dependency Graph Context
     graph_context = ""
@@ -529,6 +868,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
             "answer": f"I can confirm `{file_path_hint}` exists in the indexed repository, but I do not have its function-level AST content in the current retrieval results. I can't state its actual function signatures from this context.",
             "question": question, "codeMatches": code_matches, "diffMatches": diff_matches,
             "signatureEvidenceMissing": True,
+            "confidenceLevel": "low",
             "citations": list(set(citations))
         }
 
@@ -575,6 +915,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
                 "question": question,
                 "matchedQuestion": fallback_match["matchedQuestion"],
                 "similarity": fallback_match["similarity"],
+                "confidenceLevel": fallback_match.get("confidenceLevel", "medium"),
                 "fromCache": True,
                 "semanticCache": True,
                 "offlineFallback": True,
@@ -588,6 +929,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
             "question": question,
             "fromCache": False,
             "offlineNoConfidentAnswer": True,
+            "confidenceLevel": "low",
             "cacheType": "offline_no_confident_match",
             "codeMatches": code_matches,
             "diffMatches": diff_matches,
@@ -618,6 +960,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     result = {
         "answer": answer_text,
         "question": question,
+        "confidenceLevel": confidence_level,
         "codeMatches": code_matches,
         "diffMatches": diff_matches,
         "codeCitations": code_meta_list,
@@ -656,15 +999,25 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
             logger.info(f"[Cache] ⚡ Returning exact match from Redis for streaming: '{question}'")
             yield {
                 "type": "meta",
+                "responseType": cached.get("type", "chat"),
                 "fromCache": True,
                 "cacheType": "exact_redis",
+                "confidenceLevel": cached.get("confidenceLevel", "high"),
+                "basedOn": cached.get("basedOn", []),
+                "steps": cached.get("steps", []),
                 "codeCitations": cached.get("codeCitations", []),
                 "gitCitations": cached.get("gitCitations", []),
                 "citations": cached.get("citations", []),
                 "matchedQuestion": cached.get("matchedQuestion")
             }
             yield {"type": "token", "token": cached["answer"]}
-            yield {"type": "done", **cached, "fromCache": True, "cacheType": "exact_redis"}
+            yield {
+                "type": "done",
+                **cached,
+                "fromCache": True,
+                "cacheType": "exact_redis",
+                "confidenceLevel": cached.get("confidenceLevel", "high")
+            }
             return
 
         semantic_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_DIRECT_THRESHOLD)
@@ -683,6 +1036,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
                 "fromCache": True,
                 "semanticCache": True,
                 "cacheType": "semantic_chromadb",
+                "confidenceLevel": semantic_match.get("confidenceLevel", "high"),
                 "similarity": semantic_match.get("similarity"),
                 "matchedQuestion": semantic_match.get("matchedQuestion"),
                 "codeCitations": semantic_match.get("codeCitations", []),
@@ -696,6 +1050,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
                 "question": question,
                 "matchedQuestion": semantic_match["matchedQuestion"],
                 "similarity": semantic_match["similarity"],
+                "confidenceLevel": semantic_match.get("confidenceLevel", "high"),
                 "fromCache": True,
                 "semanticCache": True,
                 "cacheType": "semantic_chromadb",
@@ -705,6 +1060,153 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
             }
             return
 
+    # Guided Change Assistant path for task-oriented questions
+    if _is_task_oriented_question(question):
+        analogous = await find_analogous_feature(repo_path, index_id, question)
+        template_files = analogous.get("templateFiles", [])
+        code_matches = analogous.get("codeMatches", [])
+        diff_matches = analogous.get("diffMatches", [])
+        connected_links = analogous.get("connectedLinks", [])
+        confidence_level = compute_confidence_level(code_matches)
+
+        graph_context = ""
+        coverage_context = ""
+        if repo_path:
+            cached_graph = await cache_service.get(f"graph:{repo_path}")
+            coverage_context = _build_coverage_context(report)
+            if cached_graph and cached_graph.get("links"):
+                top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
+                graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
+
+        code_blocks_str = []
+        citations = []
+        for i, c in enumerate(code_matches):
+            meta = c.get("metadata", {})
+            fp = meta.get("filePath", "unknown")
+            s = meta.get("startLine", 1)
+            e = meta.get("endLine", 1)
+            citations.append(f"{fp}:{s}-{e}")
+            code_blocks_str.append(f"[Code Block {i+1}] File: {fp} (Lines {s}-{e}):\n```\n{c.get('content')}\n```")
+
+        code_context = "\n\n".join(code_blocks_str)
+
+        code_meta_list = [
+            {
+                "filePath": c.get("metadata", {}).get("filePath"),
+                "name": c.get("metadata", {}).get("name"),
+                "startLine": c.get("metadata", {}).get("startLine"),
+                "endLine": c.get("metadata", {}).get("endLine"),
+                "snippet": (c.get("content") or "")[:300]
+            }
+            for c in code_matches
+        ]
+        git_meta_list = [
+            {
+                "hash": d.get("metadata", {}).get("hash"),
+                "author": d.get("metadata", {}).get("author"),
+                "date": d.get("metadata", {}).get("date"),
+                "summary": (d.get("content") or "")[:200]
+            }
+            for d in diff_matches
+        ]
+
+        yield {
+            "type": "meta",
+            "responseType": "guided_steps",
+            "confidenceLevel": confidence_level,
+            "basedOn": template_files,
+            "codeCitations": code_meta_list,
+            "gitCitations": git_meta_list,
+            "citations": list(set(citations))
+        }
+
+        system_prompt = _build_guided_change_prompt(
+            question=question,
+            template_files=template_files,
+            connected_links=connected_links,
+            code_context=code_context,
+            graph_context=graph_context,
+            coverage_context=coverage_context
+        )
+
+        full_chunks = []
+        try:
+            chat_model = get_chat_model(temperature=0.2)
+            async for chunk in chat_model.astream(system_prompt):
+                content = chunk.content if hasattr(chunk, "content") else str(chunk)
+                if isinstance(content, list):
+                    text_chunk = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
+                else:
+                    text_chunk = str(content)
+                if text_chunk:
+                    full_chunks.append(text_chunk)
+                    yield {"type": "token", "token": text_chunk}
+            answer_text = "".join(full_chunks)
+        except Exception as llm_error:
+            logger.warning(f"[Guided Change] LLM stream error: {llm_error}")
+            fallback_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
+            if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
+                yield {"type": "token", "token": fallback_match["answer"]}
+                yield {
+                    "type": "done",
+                    "responseType": "guided_steps",
+                    "steps": fallback_match.get("steps", []),
+                    "basedOn": fallback_match.get("basedOn", template_files),
+                    "answer": fallback_match["answer"],
+                    "question": question,
+                    "confidenceLevel": fallback_match.get("confidenceLevel", "medium"),
+                    "fromCache": True,
+                    "semanticCache": True,
+                    "offlineFallback": True,
+                    "cacheType": "offline_semantic_fallback",
+                    "citations": list(set(citations))
+                }
+                return
+
+            no_ans = "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question."
+            yield {"type": "token", "token": no_ans}
+            yield {
+                "type": "done",
+                "responseType": "guided_steps",
+                "steps": [],
+                "basedOn": template_files,
+                "answer": no_ans,
+                "question": question,
+                "fromCache": False,
+                "offlineNoConfidentAnswer": True,
+                "confidenceLevel": "low",
+                "cacheType": "offline_no_confident_match",
+                "citations": list(set(citations))
+            }
+            return
+
+        steps = _parse_guided_steps(answer_text, template_files)
+        result = {
+            "type": "guided_steps",
+            "steps": steps,
+            "basedOn": template_files,
+            "answer": answer_text,
+            "question": question,
+            "confidenceLevel": confidence_level,
+            "codeMatches": code_matches,
+            "diffMatches": diff_matches,
+            "codeCitations": code_meta_list,
+            "gitCitations": git_meta_list,
+            "citations": list(set(citations))
+        }
+
+        await cache_service.set(cache_key, result, 86400)
+        await store_query_cache(
+            repo_path=semantic_scope,
+            question=question,
+            answer=answer_text,
+            code_citations=code_meta_list,
+            git_citations=git_meta_list
+        )
+
+        yield {"type": "done", **result}
+        return
+
     # Dual-Vector Search
     file_path_hint = _file_hint(question, report)
     profile_matches = [] if file_path_hint or not (repo_path and index_id) else await find_relevant_files(repo_path, index_id, question)
@@ -712,6 +1214,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
     matches = await search_codebase(repo_path=repo_path, question=question, top_k=5, index_id=index_id, file_path_hint=file_path_hint, file_path_hints=profile_hints)
     code_matches = matches.get("codeMatches", [])
     diff_matches = matches.get("diffMatches", [])
+    confidence_level = compute_confidence_level(code_matches)
 
     # Dependency Graph Context
     graph_context = ""
@@ -775,6 +1278,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
         yield {
             "type": "meta",
             "signatureEvidenceMissing": True,
+            "confidenceLevel": "low",
             "codeCitations": code_meta_list,
             "gitCitations": git_meta_list,
             "citations": list(set(citations))
@@ -787,6 +1291,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
             "codeMatches": code_matches,
             "diffMatches": diff_matches,
             "signatureEvidenceMissing": True,
+            "confidenceLevel": "low",
             "citations": list(set(citations))
         }
         return
@@ -794,6 +1299,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
     # Yield early metadata so frontend can render citations immediately
     yield {
         "type": "meta",
+        "confidenceLevel": confidence_level,
         "codeCitations": code_meta_list,
         "gitCitations": git_meta_list,
         "citations": list(set(citations))
@@ -848,6 +1354,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
                 "question": question,
                 "matchedQuestion": fallback_match["matchedQuestion"],
                 "similarity": fallback_match["similarity"],
+                "confidenceLevel": fallback_match.get("confidenceLevel", "medium"),
                 "fromCache": True,
                 "semanticCache": True,
                 "offlineFallback": True,
@@ -864,6 +1371,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
             "question": question,
             "fromCache": False,
             "offlineNoConfidentAnswer": True,
+            "confidenceLevel": "low",
             "cacheType": "offline_no_confident_match",
             "citations": list(set(citations))
         }
@@ -872,6 +1380,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
     result = {
         "answer": answer_text,
         "question": question,
+        "confidenceLevel": confidence_level,
         "codeMatches": code_matches,
         "diffMatches": diff_matches,
         "codeCitations": code_meta_list,

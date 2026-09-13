@@ -4,8 +4,9 @@ import asyncio
 import logging
 import shutil
 import uuid
+import time
 from pathlib import PurePosixPath
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -70,6 +71,36 @@ class TutorialExportRequest(BaseModel):
 class EmailPdfRequest(BaseModel):
     repoPath: str
     email: str
+
+# 30 days retention TTL in Redis.
+# LIMITATION NOTE: Redis acts as an ephemeral caching tier; conversation history is not indefinitely persistent.
+CONVERSATION_TTL_SECONDS = 30 * 86400
+
+class CreateConversationRequest(BaseModel):
+    repoPath: Optional[str] = None
+
+class MessagePayload(BaseModel):
+    role: str
+    text: Optional[str] = None
+    content: Optional[str] = None
+    codeCitations: Optional[List[Dict[str, Any]]] = None
+    gitCitations: Optional[List[Dict[str, Any]]] = None
+    citations: Optional[List[str]] = None
+    confidenceLevel: Optional[str] = None
+    fromCache: Optional[bool] = None
+    semanticCache: Optional[bool] = None
+    cacheType: Optional[str] = None
+    matchedQuestion: Optional[str] = None
+    similarity: Optional[float] = None
+    offlineFallback: Optional[bool] = None
+    offlineNoConfidentAnswer: Optional[bool] = None
+    type: Optional[str] = None
+    steps: Optional[List[Dict[str, Any]]] = None
+    basedOn: Optional[List[Dict[str, Any]]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "allow"
 
 MAX_UPLOAD_FILES = 2000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -315,6 +346,90 @@ async def chat_stream_get(
     except Exception as e:
         logger.error(f"Chat stream error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _validate_conversation_id(conversation_id: str) -> str:
+    """Validate that conversation_id is a well-formed UUID before using in cache keys."""
+    try:
+        return str(uuid.UUID(str(conversation_id)))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid conversation ID format. Must be a valid UUID."
+        ) from exc
+
+
+@app.post("/api/conversations")
+async def create_conversation(req: CreateConversationRequest):
+    """Create a new conversation session tied to a repoPath.
+
+    Conversation data is cached in Redis under 'conversation:{id}' with a 30-day TTL.
+    NOTE: Redis provides ephemeral thread persistence, not indefinite archival storage.
+    """
+    conversation_id = str(uuid.uuid4())
+    conv_data = {
+        "conversationId": conversation_id,
+        "repoPath": req.repoPath,
+        "messages": [],
+        "createdAt": time.time(),
+        "updatedAt": time.time()
+    }
+    await cache_service.set(f"conversation:{conversation_id}", conv_data, CONVERSATION_TTL_SECONDS)
+    return {
+        "conversationId": conversation_id,
+        "repoPath": req.repoPath
+    }
+
+
+@app.post("/api/conversations/{conversation_id}/messages")
+async def append_conversation_message(conversation_id: str, message: MessagePayload):
+    """Append a single message (with metadata) to the conversation history.
+
+    Rejects malformed conversation IDs with HTTP 400.
+    """
+    valid_id = _validate_conversation_id(conversation_id)
+    cache_key = f"conversation:{valid_id}"
+    conv_data = await cache_service.get(cache_key)
+    if not conv_data:
+        raise HTTPException(status_code=404, detail="Conversation not found or expired.")
+
+    msg_dict = message.model_dump() if hasattr(message, "model_dump") else message.dict()
+    text_content = msg_dict.get("text") or msg_dict.get("content") or ""
+    msg_dict["text"] = text_content
+    msg_dict["content"] = text_content
+
+    if "messages" not in conv_data or not isinstance(conv_data["messages"], list):
+        conv_data["messages"] = []
+
+    conv_data["messages"].append(msg_dict)
+    conv_data["updatedAt"] = time.time()
+
+    await cache_service.set(cache_key, conv_data, CONVERSATION_TTL_SECONDS)
+    return {
+        "success": True,
+        "conversationId": valid_id,
+        "messagesCount": len(conv_data["messages"])
+    }
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """Retrieve full conversation history and associated repoPath.
+
+    Rejects malformed conversation IDs with HTTP 400.
+    """
+    valid_id = _validate_conversation_id(conversation_id)
+    conv_data = await cache_service.get(f"conversation:{valid_id}")
+    if not conv_data:
+        raise HTTPException(status_code=404, detail="Conversation not found or expired.")
+
+    return {
+        "conversationId": valid_id,
+        "repoPath": conv_data.get("repoPath"),
+        "messages": conv_data.get("messages", []),
+        "createdAt": conv_data.get("createdAt"),
+        "updatedAt": conv_data.get("updatedAt")
+    }
 
 
 @app.get("/api/graph")
