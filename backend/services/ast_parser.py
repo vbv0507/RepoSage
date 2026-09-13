@@ -163,14 +163,152 @@ def _parse_python_ast(content: str, rel_path: str) -> tuple[List[Dict[str, Any]]
         return [], f"python_ast_error: {exc.msg if isinstance(exc, SyntaxError) else str(exc)}"
     return chunks, None
 
+_ts_parsers = {}
+
+def _get_treesitter_parser(ext: str):
+    """
+    Lazily loads and caches Tree-sitter parsers for JS, TS, and TSX.
+    """
+    global _ts_parsers
+    if ext in _ts_parsers:
+        return _ts_parsers[ext]
+
+    try:
+        from tree_sitter import Language, Parser
+        if ext == '.tsx':
+            import tree_sitter_typescript
+            parser = Parser(Language(tree_sitter_typescript.language_tsx()))
+        elif ext == '.ts':
+            import tree_sitter_typescript
+            parser = Parser(Language(tree_sitter_typescript.language_typescript()))
+        elif ext in {'.js', '.jsx', '.mjs', '.cjs'}:
+            import tree_sitter_javascript
+            parser = Parser(Language(tree_sitter_javascript.language()))
+        else:
+            parser = None
+        _ts_parsers[ext] = parser
+        return parser
+    except Exception as exc:
+        logger.warning(f"Tree-sitter parser initialization failed for {ext}: {exc}")
+        _ts_parsers[ext] = None
+        return None
+
+def _parse_js_ts_treesitter(content: str, rel_path: str, ext: str) -> tuple[List[Dict[str, Any]], str | None]:
+    """
+    Parses JavaScript, TypeScript, and TSX files into AST chunks using Tree-sitter.
+    Extracts function declarations, arrow functions assigned to variables,
+    class declarations, and class methods (including async and static variants).
+    """
+    parser = _get_treesitter_parser(ext)
+    if parser is None:
+        return [], "treesitter_not_available"
+
+    try:
+        content_bytes = content.encode('utf-8')
+        tree = parser.parse(content_bytes)
+        lines = content.split('\n')
+        chunks: List[Dict[str, Any]] = []
+
+        def extract(node):
+            if node.type == 'export_statement':
+                for child in node.children:
+                    if child.type != 'export':
+                        extract(child)
+                return
+
+            if node.type == 'class_declaration':
+                name_node = node.child_by_field_name('name')
+                class_name = name_node.text.decode('utf-8', errors='ignore') if name_node else 'AnonymousClass'
+                start = node.start_point.row + 1
+                end = node.end_point.row + 1
+                code_snip = '\n'.join(lines[start - 1:end]).strip()
+                chunks.append({
+                    "name": class_name,
+                    "type": "class",
+                    "startLine": start,
+                    "endLine": end,
+                    "code": code_snip,
+                    "filePath": rel_path,
+                    "summary": f"Class `{class_name}` in {rel_path}"
+                })
+                body = node.child_by_field_name('body')
+                if body:
+                    for child in body.children:
+                        if child.type == 'method_definition':
+                            m_name_node = child.child_by_field_name('name')
+                            m_name = m_name_node.text.decode('utf-8', errors='ignore') if m_name_node else 'method'
+                            m_start = child.start_point.row + 1
+                            m_end = child.end_point.row + 1
+                            chunks.append({
+                                "name": f"{class_name}.{m_name}",
+                                "type": "method",
+                                "startLine": m_start,
+                                "endLine": m_end,
+                                "code": '\n'.join(lines[m_start - 1:m_end]).strip(),
+                                "filePath": rel_path,
+                                "summary": f"Method `{class_name}.{m_name}` in {rel_path}"
+                            })
+                return
+
+            if node.type == 'function_declaration':
+                name_node = node.child_by_field_name('name')
+                fn_name = name_node.text.decode('utf-8', errors='ignore') if name_node else 'anonymous'
+                start = node.start_point.row + 1
+                end = node.end_point.row + 1
+                chunks.append({
+                    "name": fn_name,
+                    "type": "function",
+                    "startLine": start,
+                    "endLine": end,
+                    "code": '\n'.join(lines[start - 1:end]).strip(),
+                    "filePath": rel_path,
+                    "summary": f"Function `{fn_name}` in {rel_path}"
+                })
+                return
+
+            if node.type in ('lexical_declaration', 'variable_declaration'):
+                for decl in node.children:
+                    if decl.type == 'variable_declarator':
+                        val = decl.child_by_field_name('value')
+                        if val and val.type in ('arrow_function', 'function_expression'):
+                            name_node = decl.child_by_field_name('name')
+                            fn_name = name_node.text.decode('utf-8', errors='ignore') if name_node else 'anonymous'
+                            start = decl.start_point.row + 1
+                            end = decl.end_point.row + 1
+                            fn_type = "arrow_function" if val.type == 'arrow_function' else "function"
+                            chunks.append({
+                                "name": fn_name,
+                                "type": fn_type,
+                                "startLine": start,
+                                "endLine": end,
+                                "code": '\n'.join(lines[start - 1:end]).strip(),
+                                "filePath": rel_path,
+                                "summary": f"{fn_type.replace('_', ' ').capitalize()} `{fn_name}` in {rel_path}"
+                            })
+                return
+
+            for child in node.children:
+                extract(child)
+
+        extract(tree.root_node)
+        return chunks, None
+    except Exception as exc:
+        return [], f"treesitter_error: {str(exc)}"
+
 def _parse_js_ts_functions(content: str, rel_path: str) -> List[Dict[str, Any]]:
+    """
+    Fallback regex-based parser for JS/TS when Tree-sitter is unavailable.
+    KNOWN LIMITATION: Regex parsing does not build a full concrete syntax tree,
+    so nested closures, decorators, and destructured parameters may not be fully parsed.
+    """
     chunks = []
     lines = content.split('\n')
     
-    # Regex patterns for JS/TS functions and classes
+    # Regex patterns for JS/TS functions, classes, and class methods
     fn_pattern = re.compile(r'^(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_$]+)\s*\(', re.MULTILINE)
-    arrow_pattern = re.compile(r'^(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>', re.MULTILINE)
+    arrow_pattern = re.compile(r'^(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[a-zA-Z0-9_$]+)\s*=>', re.MULTILINE)
     class_pattern = re.compile(r'^(?:export\s+)?class\s+([a-zA-Z0-9_$]+)', re.MULTILINE)
+    method_pattern = re.compile(r'^\s+(?:(?:public|private|protected|static|async)\s+)*([a-zA-Z0-9_$]+)\s*\([^)]*\)\s*\{', re.MULTILINE)
 
     matched_indices = []
     for m in fn_pattern.finditer(content):
@@ -179,10 +317,15 @@ def _parse_js_ts_functions(content: str, rel_path: str) -> List[Dict[str, Any]]:
         matched_indices.append((m.start(), m.group(1), "arrow_function"))
     for m in class_pattern.finditer(content):
         matched_indices.append((m.start(), m.group(1), "class"))
+    for m in method_pattern.finditer(content):
+        name = m.group(1)
+        if name not in {'if', 'for', 'while', 'switch', 'catch'}:
+            matched_indices.append((m.start(), name, "method"))
 
     matched_indices.sort(key=lambda x: x[0])
 
-    for start_pos, name, node_type in matched_indices[:20]:
+    # Cap at 500 symbols per file instead of 20
+    for start_pos, name, node_type in matched_indices[:500]:
         line_no = content[:start_pos].count('\n') + 1
         end_line = min(len(lines), line_no + 45)
         snippet = '\n'.join(lines[line_no - 1:end_line]).strip()
@@ -217,7 +360,13 @@ def parse_code_file(file_path: str, repo_path: str) -> Dict[str, Any]:
         if ast_warning:
             warnings.append(ast_warning)
     elif ext in {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}:
-        chunks = _parse_js_ts_functions(content, rel_path)
+        ts_chunks, ts_warning = _parse_js_ts_treesitter(content, rel_path, ext)
+        if ts_chunks:
+            chunks = ts_chunks
+        else:
+            if ts_warning:
+                warnings.append(ts_warning)
+            chunks = _parse_js_ts_functions(content, rel_path)
 
     # If no structural symbols were found, use standard line-based chunks
     if not chunks:

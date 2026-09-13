@@ -6,6 +6,8 @@ services:
       - "6379:6379"
     restart: always
     command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
 
   chromadb:
     image: chromadb/chroma:latest
@@ -59,3 +61,9 @@ services:
     depends_on:
       - backend
     restart: always
+
+# Named volume for Redis cache persistence across container restarts.
+# Redis is used as a cache rather than the primary source of truth,
+# so data loss is non-critical, but preserving the cache avoids expensive re-computation.
+volumes:
+  redis_data:

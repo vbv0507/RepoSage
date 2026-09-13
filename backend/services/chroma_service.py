@@ -4,6 +4,8 @@ import time
 import json
 import hashlib
 import logging
+import asyncio
+import threading
 import requests
 from typing import List, Dict, Any, Optional
 import chromadb
@@ -17,35 +19,50 @@ CHROMA_URL = os.getenv("CHROMA_URL", "http://localhost:8000")
 class ResilientEmbeddingFunction(EmbeddingFunction):
     """
     Resilient multi-tier embedding function:
-    1. Google Gemini Embeddings (models/text-embedding-004) if GEMINI_API_KEY is provided
-    2. Deterministic normalized hash vector (384 dims, zero crashes)
+    1. Google Gemini Embeddings (models/text-embedding-004) with retry and backoff
+    2. Local ONNX DefaultEmbeddingFunction (all-MiniLM-L6-v2) fallback
+    3. Deterministic normalized hash vector emergency fallback (zero crashes)
     """
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
 
     def __call__(self, input: Documents) -> Embeddings:
-        # 1. Try Gemini Cloud Embeddings
+        # 1. Try Gemini Cloud Embeddings (with 1 retry after 300ms)
         if self.api_key:
-            try:
-                requests_data = [
-                    {
-                        "model": "models/text-embedding-004",
-                        "content": {"parts": [{"text": (text or "")[:2048]}]}
-                    }
-                    for text in input
-                ]
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={self.api_key}"
-                # A fast fallback is preferable to making a browser wait for
-                # many sequential cloud-embedding retries during re-indexing.
-                resp = requests.post(url, json={"requests": requests_data}, timeout=(5, 10))
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if "embeddings" in data and len(data["embeddings"]) > 0:
-                        return [e["values"] for e in data["embeddings"]]
-            except Exception as e:
-                logger.warning(f"[ChromaDB] Gemini embedding call failed, falling back to local vector: {e}")
+            requests_data = [
+                {
+                    "model": "models/text-embedding-004",
+                    "content": {"parts": [{"text": (text or "")[:2048]}]}
+                }
+                for text in input
+            ]
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={self.api_key}"
+            
+            for attempt in range(2):
+                try:
+                    resp = requests.post(url, json={"requests": requests_data}, timeout=(5, 10))
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if "embeddings" in data and len(data["embeddings"]) > 0:
+                            return [e["values"] for e in data["embeddings"]]
+                    else:
+                        logger.warning(f"[ChromaDB] Gemini embedding attempt {attempt + 1} returned status {resp.status_code}")
+                except Exception as e:
+                    logger.warning(f"[ChromaDB] Gemini embedding attempt {attempt + 1} failed: {e}")
+                
+                if attempt == 0:
+                    time.sleep(0.3)
 
-        # 2. Resilient Normalized Hash Vector (384 dimensions)
+        # 2. Resilient Local ONNX Embedding Fallback (DefaultEmbeddingFunction)
+        try:
+            logger.warning("[ChromaDB] Gemini embedding unavailable. Falling back to local ONNX embeddings (all-MiniLM-L6-v2).")
+            local_ef = get_local_query_embedding_function()
+            if local_ef is not None and not isinstance(local_ef, ResilientEmbeddingFunction):
+                return local_ef(input)
+        except Exception as onnx_err:
+            logger.warning(f"[ChromaDB] Local ONNX fallback failed: {onnx_err}. Using emergency hash vectors.")
+
+        # 3. Emergency Normalized Hash Vector (384 dimensions)
         results = []
         for text in input:
             vec = [0.0] * 384
@@ -56,6 +73,7 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
             results.append([v / mag for v in vec])
         return results
 
+
 _client = None
 _embedding_fn = None
 _code_collection = None
@@ -63,21 +81,27 @@ _diffs_collection = None
 _queries_collection = None
 _file_profiles_collection = None
 _local_embedding_fn = None
+_local_ef_lock = threading.Lock()
+_ef_lock = threading.Lock()
 
 def get_local_query_embedding_function():
     global _local_embedding_fn
     if _local_embedding_fn is None:
-        try:
-            _local_embedding_fn = chromadb_ef.DefaultEmbeddingFunction()
-        except Exception as e:
-            logger.warning(f"[ChromaDB] DefaultEmbeddingFunction unavailable: {e}. Using resilient embedding.")
-            _local_embedding_fn = get_embedding_function()
+        with _local_ef_lock:
+            if _local_embedding_fn is None:
+                try:
+                    _local_embedding_fn = chromadb_ef.DefaultEmbeddingFunction()
+                except Exception as e:
+                    logger.warning(f"[ChromaDB] DefaultEmbeddingFunction unavailable: {e}. Using resilient embedding.")
+                    _local_embedding_fn = get_embedding_function()
     return _local_embedding_fn
 
 def get_embedding_function() -> ResilientEmbeddingFunction:
     global _embedding_fn
     if _embedding_fn is None:
-        _embedding_fn = ResilientEmbeddingFunction()
+        with _ef_lock:
+            if _embedding_fn is None:
+                _embedding_fn = ResilientEmbeddingFunction()
     return _embedding_fn
 
 def get_chroma_client():
@@ -162,13 +186,36 @@ def get_file_profiles_collection():
     return _file_profiles_collection
 
 
-async def store_file_profiles(repo_path: str, parsed_files: List[Dict[str, Any]], index_id: str) -> dict:
+async def delete_repo_file_vectors(repo_path: str, file_paths: Any) -> dict:
+    """Delete code vectors and file profiles for specific files in a repo (incremental delete)."""
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+    if not file_paths:
+        return {"deleted": 0}
+    code_coll = get_code_collection()
+    profile_coll = get_file_profiles_collection()
+    deleted_count = 0
+    for fp in file_paths:
+        try:
+            code_coll.delete(where={"$and": [{"repoPath": repo_path}, {"filePath": fp}]})
+            deleted_count += 1
+        except Exception as exc:
+            logger.warning(f"Could not delete code chunks for {repo_path} ({fp}): {exc}")
+        try:
+            profile_coll.delete(where={"$and": [{"repoPath": repo_path}, {"filePath": fp}]})
+        except Exception as exc:
+            logger.warning(f"Could not delete profile for {repo_path} ({fp}): {exc}")
+    return {"deleted": deleted_count}
+
+
+async def store_file_profiles(repo_path: str, parsed_files: List[Dict[str, Any]], index_id: str, clear_prior: bool = False) -> dict:
     """Embed one compact role/symbol profile per source file for routing."""
     coll = get_file_profiles_collection()
-    try:
-        coll.delete(where={"repoPath": repo_path})
-    except Exception as exc:
-        logger.warning("Could not clear old file profiles for %s: %s", repo_path, exc)
+    if clear_prior:
+        try:
+            coll.delete(where={"repoPath": repo_path})
+        except Exception as exc:
+            logger.warning("Could not clear old file profiles for %s: %s", repo_path, exc)
     ids, documents, metadatas = [], [], []
     for parsed in parsed_files:
         file_path = parsed["filePath"]
@@ -179,7 +226,7 @@ async def store_file_profiles(repo_path: str, parsed_files: List[Dict[str, Any]]
         profile = f"File: {file_path}\nExtension: {parsed.get('extension')}\n" + "\n".join(symbols)
         if not symbols:
             profile += "\nContent summary:\n" + "\n".join(chunk.get("code", "")[:300] for chunk in parsed.get("chunks", [])[:3])
-        ids.append("profile_" + hashlib.sha256(f"{repo_path}:{index_id}:{file_path}".encode()).hexdigest()[:32])
+        ids.append("profile_" + hashlib.sha256(f"{repo_path}:{file_path}".encode()).hexdigest()[:32])
         documents.append(profile[:12000])
         metadatas.append({"repoPath": repo_path, "indexId": index_id, "filePath": file_path})
     stored_count = 0
@@ -196,9 +243,9 @@ async def store_file_profiles(repo_path: str, parsed_files: List[Dict[str, Any]]
     return {"storedCount": stored_count}
 
 
-async def find_relevant_files(repo_path: str, index_id: str, question: str, top_k: int = 3) -> List[Dict[str, Any]]:
+async def find_relevant_files(repo_path: str, index_id: Optional[str] = None, question: str = "", top_k: int = 3) -> List[Dict[str, Any]]:
     try:
-        res = get_file_profiles_collection().query(query_texts=[question], n_results=top_k, where=_where(repo_path, index_id))
+        res = get_file_profiles_collection().query(query_texts=[question], n_results=top_k, where=_where(repo_path))
         if not res or not res.get("metadatas") or not res["metadatas"][0]:
             return []
         distances = res.get("distances", [[]])[0]
@@ -207,51 +254,72 @@ async def find_relevant_files(repo_path: str, index_id: str, question: str, top_
         logger.warning("File-profile routing failed: %s", exc)
         return []
 
-async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]], index_id: str) -> dict:
+async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]], index_id: str, clear_prior: bool = False) -> dict:
+    if not chunks:
+        return {"storedCount": 0, "failedFiles": []}
     coll = get_code_collection()
     
-    # Delete prior vectors for this repo
-    try:
-        coll.delete(where={"repoPath": repo_path})
-    except Exception:
-        pass
+    # Delete prior vectors for this repo only if explicitly requested (e.g. force refresh)
+    if clear_prior:
+        try:
+            coll.delete(where={"repoPath": repo_path})
+        except Exception:
+            pass
 
     ids = []
     documents = []
     metadatas = []
+    seen_ids = set()
 
-    for i, chunk in enumerate(chunks):
+    for chunk in chunks:
         file_path = chunk.get("filePath", "")
         start_line = chunk.get("startLine", 1)
-        uid = "code_" + hashlib.sha256(f"{repo_path}:{index_id}:{file_path}:{start_line}:{i}".encode()).hexdigest()[:32]
+        name = chunk.get("name") or "unnamed"
+        code = chunk.get("code") or ""
+        uid = "code_" + hashlib.sha256(f"{repo_path}:{file_path}:{start_line}:{name}:{code[:80]}".encode()).hexdigest()[:32]
+        if uid in seen_ids:
+            continue
+        seen_ids.add(uid)
+
         ids.append(uid)
-        documents.append((chunk.get("code") or "")[:2000])
+        documents.append(code[:2000])
         metadatas.append({
             "repoPath": repo_path,
             "indexId": index_id,
             "filePath": file_path,
-            "name": chunk.get("name") or "unnamed",
+            "name": name,
             "type": chunk.get("type") or "code",
             "startLine": int(start_line),
             "endLine": int(chunk.get("endLine", 1)),
             "summary": (chunk.get("summary") or "")[:400]
         })
 
-    # Batch add
+    # Parallel batch add via asyncio.gather and asyncio.to_thread
     BATCH_SIZE = 50
     failed_files = []
-    stored_count = 0
+    batches = []
     for i in range(0, len(ids), BATCH_SIZE):
-        b_ids = ids[i:i + BATCH_SIZE]
-        b_docs = documents[i:i + BATCH_SIZE]
-        b_metas = metadatas[i:i + BATCH_SIZE]
+        batches.append((
+            ids[i:i + BATCH_SIZE],
+            documents[i:i + BATCH_SIZE],
+            metadatas[i:i + BATCH_SIZE]
+        ))
+
+    async def _add_batch(b_ids, b_docs, b_metas):
         try:
-            coll.add(ids=b_ids, documents=b_docs, metadatas=b_metas)
-            stored_count += len(b_ids)
+            await asyncio.to_thread(coll.add, ids=b_ids, documents=b_docs, metadatas=b_metas)
+            return len(b_ids), None
         except Exception as exc:
             affected_files = sorted({meta["filePath"] for meta in b_metas})
             logger.error("Failed to embed code batch for %s: %s", affected_files, exc)
-            failed_files.extend({"path": file_path, "reason": f"embedding_error: {exc}"} for file_path in affected_files)
+            batch_fails = [{"path": fp, "reason": f"embedding_error: {exc}"} for fp in affected_files]
+            return 0, batch_fails
+
+    results = await asyncio.gather(*[_add_batch(b[0], b[1], b[2]) for b in batches])
+    stored_count = sum(r[0] for r in results)
+    for r in results:
+        if r[1]:
+            failed_files.extend(r[1])
 
     return {"storedCount": stored_count, "failedFiles": failed_files}
 
@@ -299,8 +367,6 @@ def _where(repo_path: Optional[str], index_id: Optional[str] = None, file_path: 
     clauses = []
     if repo_path:
         clauses.append({"repoPath": repo_path})
-    if index_id:
-        clauses.append({"indexId": index_id})
     if file_path:
         clauses.append({"filePath": file_path})
     if not clauses:
@@ -324,32 +390,32 @@ async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 
     code_coll = get_code_collection()
     diffs_coll = get_diffs_collection()
 
-    where_filter = _where(repo_path, index_id)
+    where_filter = _where(repo_path)
 
     # 1. Query Code
     try:
-        code_res = code_coll.query(query_texts=[question], n_results=top_k, where=where_filter)
+        code_res = await asyncio.to_thread(code_coll.query, query_texts=[question], n_results=top_k, where=where_filter)
     except Exception:
         code_res = None
 
     # An unscoped retry is only safe for callers that intentionally did not
     # specify a repository/index.  Otherwise it could surface another
     # repository or a stale indexing run.
-    if (not repo_path and not index_id) and (not code_res or not code_res.get("documents") or not code_res["documents"][0]):
+    if not repo_path and (not code_res or not code_res.get("documents") or not code_res["documents"][0]):
         try:
-            code_res = code_coll.query(query_texts=[question], n_results=top_k)
+            code_res = await asyncio.to_thread(code_coll.query, query_texts=[question], n_results=top_k)
         except Exception:
             code_res = None
 
     # 2. Query Historical Diffs
     try:
-        diffs_res = diffs_coll.query(query_texts=[question], n_results=3, where=where_filter)
+        diffs_res = await asyncio.to_thread(diffs_coll.query, query_texts=[question], n_results=3, where=where_filter)
     except Exception:
         diffs_res = None
 
-    if (not repo_path and not index_id) and (not diffs_res or not diffs_res.get("documents") or not diffs_res["documents"][0]):
+    if not repo_path and (not diffs_res or not diffs_res.get("documents") or not diffs_res["documents"][0]):
         try:
-            diffs_res = diffs_coll.query(query_texts=[question], n_results=3)
+            diffs_res = await asyncio.to_thread(diffs_coll.query, query_texts=[question], n_results=3)
         except Exception:
             diffs_res = None
 
@@ -361,7 +427,8 @@ async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 
         try:
             focused = []
             for focused_path in focused_paths[:3]:
-                focused.extend(_matches_from_result(code_coll.query(query_texts=[question], n_results=8, where=_where(repo_path, index_id, focused_path))))
+                f_res = await asyncio.to_thread(code_coll.query, query_texts=[question], n_results=8, where=_where(repo_path, file_path=focused_path))
+                focused.extend(_matches_from_result(f_res))
             seen = set()
             code_matches = [match for match in focused + code_matches if not ((key := (match["metadata"].get("filePath"), match["metadata"].get("startLine"))) in seen or seen.add(key))]
         except Exception as exc:
@@ -388,23 +455,48 @@ async def search_codebase(repo_path: Optional[str], question: str, top_k: int = 
 async def get_repo_vector_stats(repo_path: str, index_id: Optional[str] = None) -> dict:
     try:
         coll = get_code_collection()
-        res = coll.get(where=_where(repo_path, index_id), limit=10000, include=["metadatas"])
-        if not res or not res.get("ids"):
-            return {"exists": False, "count": 0, "filesCount": 0}
-        
+        PAGE_SIZE = 5000
+        offset = 0
+        all_ids = []
         file_paths = set()
-        for meta in (res.get("metadatas") or []):
-            if meta and meta.get("filePath"):
-                file_paths.add(meta["filePath"])
+        is_truncated = False
+
+        while True:
+            try:
+                res = coll.get(where=_where(repo_path), limit=PAGE_SIZE, offset=offset, include=["metadatas"])
+            except Exception as get_err:
+                logger.warning(f"Error fetching vector stats page at offset {offset}: {get_err}")
+                is_truncated = True
+                break
+
+            if not res or not res.get("ids"):
+                break
+            
+            ids = res["ids"]
+            all_ids.extend(ids)
+            for meta in (res.get("metadatas") or []):
+                if meta and meta.get("filePath"):
+                    file_paths.add(meta["filePath"])
+            
+            if len(ids) < PAGE_SIZE:
+                break
+            offset += len(ids)
+            
+            # Guard against runaway pagination
+            if offset >= 200000:
+                is_truncated = True
+                break
 
         return {
-            "exists": True,
-            "count": len(res["ids"]),
-            "filesCount": len(file_paths)
+            "exists": len(all_ids) > 0,
+            "count": len(all_ids),
+            "filesCount": len(file_paths),
+            "truncated": is_truncated
         }
     except Exception as e:
         logger.warning(f"Error getting repo vector stats: {e}")
-        return {"exists": False, "count": 0, "filesCount": 0}
+        return {"exists": False, "count": 0, "filesCount": 0, "truncated": False}
+
 
 async def clear_repo_vectors(repo_path: str) -> dict:
     try:
@@ -482,8 +574,8 @@ async def find_semantic_query_match(
             include=["documents", "metadatas", "distances"]
         )
         
-        # If repo-filtered returned no results, check without where filter
-        if not res or not res.get("documents") or not res["documents"][0]:
+        # Only check without where filter if repo_path was intentionally not specified
+        if not repo_path and (not res or not res.get("documents") or not res["documents"][0]):
             try:
                 res = coll.query(
                     query_texts=[question.strip()],

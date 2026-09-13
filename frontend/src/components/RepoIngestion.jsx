@@ -254,9 +254,14 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo }) {
             <details style={{ marginTop: '14px', borderTop: '1px solid var(--border-color)', paddingTop: '12px' }}>
               <summary style={{ cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '12px' }}>
                 Index coverage report — {stats.ingestionReport.summary?.parsed ?? stats.ingestionReport.parsedFiles?.length ?? 0} parsed, {stats.ingestionReport.summary?.skipped ?? stats.ingestionReport.skippedFiles?.length ?? 0} skipped
-                {stats.ingestionReport.truncated ? ' (FILE LIMIT REACHED)' : ''}
+                {stats.truncated ? ' (VECTOR LIMIT REACHED)' : (stats.ingestionReport.truncated ? ' (FILE LIMIT REACHED)' : '')}
               </summary>
               <div style={{ marginTop: '10px', fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                {stats.truncated && (
+                  <p style={{ color: '#fbbf24', marginBottom: '8px' }}>
+                    Vector count truncated: the vector database query reached its maximum result limit ({stats.chunksCount || stats.count} chunks counted).
+                  </p>
+                )}
                 {stats.ingestionReport.truncated && (
                   <p style={{ color: '#fbbf24', marginBottom: '8px' }}>
                     Index is incomplete: the {stats.ingestionReport.limits?.maxSourceFiles}-file limit was reached. Results must not be used to conclude a module is absent.

@@ -29,8 +29,25 @@ export default function ChatCopilot({ activeRepo }) {
     setMessages(prev => [...prev, userMsg]);
     setLoading(true);
 
+    let accumulatedText = '';
+    const assistantPlaceholder = {
+      role: 'assistant',
+      text: '',
+      codeCitations: [],
+      gitCitations: [],
+      fromCache: false,
+      semanticCache: false,
+      cacheType: null,
+      matchedQuestion: null,
+      similarity: null,
+      offlineFallback: false,
+      offlineNoConfidentAnswer: false
+    };
+
+    setMessages(prev => [...prev, assistantPlaceholder]);
+
     try {
-      const res = await fetch(`${API_BASE}/api/chat`, {
+      const res = await fetch(`${API_BASE}/api/chat-stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -40,35 +57,127 @@ export default function ChatCopilot({ activeRepo }) {
         })
       });
 
-      if (!res.ok) {
-        throw new Error(`Server returned HTTP ${res.status}`);
+      if (!res.ok || !res.body) {
+        throw new Error(`Streaming failed with status ${res.status}`);
       }
 
-      const data = await res.json();
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        text: data.answer,
-        codeCitations: data.codeCitations || [],
-        gitCitations: data.gitCitations || [],
-        fromCache: data.fromCache,
-        semanticCache: data.semanticCache,
-        cacheType: data.cacheType,
-        matchedQuestion: data.matchedQuestion,
-        similarity: data.similarity,
-        offlineFallback: data.offlineFallback,
-        offlineNoConfidentAnswer: data.offlineNoConfidentAnswer
-      }]);
-    } catch (err) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        text: `Error querying codebase: ${err.message}. Please ensure the backend and vector DB are active.`,
-        codeCitations: [],
-        gitCitations: []
-      }]);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const jsonStr = trimmed.slice(5).trim();
+          if (!jsonStr) continue;
+          try {
+            const data = JSON.parse(jsonStr);
+            if (data.type === 'meta') {
+              setMessages(prev => {
+                const next = [...prev];
+                const last = { ...next[next.length - 1] };
+                last.codeCitations = data.codeCitations || [];
+                last.gitCitations = data.gitCitations || [];
+                last.fromCache = Boolean(data.fromCache);
+                last.semanticCache = Boolean(data.semanticCache);
+                last.cacheType = data.cacheType;
+                last.matchedQuestion = data.matchedQuestion;
+                last.similarity = data.similarity;
+                last.offlineFallback = Boolean(data.offlineFallback);
+                last.offlineNoConfidentAnswer = Boolean(data.offlineNoConfidentAnswer);
+                next[next.length - 1] = last;
+                return next;
+              });
+            } else if (data.type === 'token') {
+              accumulatedText += data.token;
+              setMessages(prev => {
+                const next = [...prev];
+                const last = { ...next[next.length - 1] };
+                last.text = accumulatedText;
+                next[next.length - 1] = last;
+                return next;
+              });
+            } else if (data.type === 'done') {
+              setMessages(prev => {
+                const next = [...prev];
+                const last = { ...next[next.length - 1] };
+                last.text = data.answer || accumulatedText;
+                if (data.codeCitations) last.codeCitations = data.codeCitations;
+                if (data.gitCitations) last.gitCitations = data.gitCitations;
+                if (data.fromCache !== undefined) last.fromCache = data.fromCache;
+                if (data.semanticCache !== undefined) last.semanticCache = data.semanticCache;
+                if (data.cacheType !== undefined) last.cacheType = data.cacheType;
+                if (data.matchedQuestion !== undefined) last.matchedQuestion = data.matchedQuestion;
+                if (data.similarity !== undefined) last.similarity = data.similarity;
+                if (data.offlineFallback !== undefined) last.offlineFallback = data.offlineFallback;
+                if (data.offlineNoConfidentAnswer !== undefined) last.offlineNoConfidentAnswer = data.offlineNoConfidentAnswer;
+                next[next.length - 1] = last;
+                return next;
+              });
+            } else if (data.type === 'error') {
+              throw new Error(data.error || 'Streaming error');
+            }
+          } catch (parseErr) {
+            console.warn('Could not parse SSE token:', parseErr);
+          }
+        }
+      }
+    } catch (streamErr) {
+      console.warn('SSE stream failed, falling back to /api/chat:', streamErr.message);
+      // Fallback gracefully to non-streaming /api/chat
+      try {
+        const fallbackRes = await fetch(`${API_BASE}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repoPath: activeRepo,
+            question: q,
+            refresh: Boolean(forceRefresh)
+          })
+        });
+        if (!fallbackRes.ok) throw new Error(`Server returned HTTP ${fallbackRes.status}`);
+        const data = await fallbackRes.json();
+        setMessages(prev => {
+          const next = [...prev];
+          next[next.length - 1] = {
+            role: 'assistant',
+            text: data.answer,
+            codeCitations: data.codeCitations || [],
+            gitCitations: data.gitCitations || [],
+            fromCache: data.fromCache,
+            semanticCache: data.semanticCache,
+            cacheType: data.cacheType,
+            matchedQuestion: data.matchedQuestion,
+            similarity: data.similarity,
+            offlineFallback: data.offlineFallback,
+            offlineNoConfidentAnswer: data.offlineNoConfidentAnswer
+          };
+          return next;
+        });
+      } catch (fallbackErr) {
+        setMessages(prev => {
+          const next = [...prev];
+          next[next.length - 1] = {
+            role: 'assistant',
+            text: `Error querying codebase: ${fallbackErr.message}. Please ensure the backend and vector DB are active.`,
+            codeCitations: [],
+            gitCitations: []
+          };
+          return next;
+        });
+      }
     } finally {
       setLoading(false);
     }
   };
+
 
   const formatText = (txt) => {
     if (!txt) return '';

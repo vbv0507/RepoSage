@@ -157,14 +157,23 @@ export default function CodeTutorial({ activeRepo }) {
         if (data.step === 'start' || data.step === 'chapter_start') {
           setGeneratingStep(data.message || `Generating ${data.title}...`);
         } else if (data.step === 'chapter_done') {
-          incomingChapters.push(data.chapter);
-          setTutorial(prev => ({
+          const newCh = data.chapter;
+          const existingIdx = incomingChapters.findIndex(c => c.chapterIndex === newCh.chapterIndex);
+          if (existingIdx >= 0) {
+            incomingChapters[existingIdx] = newCh;
+          } else {
+            incomingChapters.push(newCh);
+          }
+          incomingChapters.sort((a, b) => a.chapterIndex - b.chapterIndex);
+
+          setTutorial({
             repoPath: activeRepo,
             repoName: activeRepo.split(/[\/\\]/).pop(),
             chapters: [...incomingChapters]
-          }));
-          setActiveChapterIndex(incomingChapters.length - 1);
-        } else if (data.step === 'complete') {
+          });
+          const currentPos = incomingChapters.findIndex(c => c.chapterIndex === newCh.chapterIndex);
+          setActiveChapterIndex(currentPos >= 0 ? currentPos : 0);
+        } else if (data.step === 'complete' || data.step === 'finished') {
           setTutorial(data.tutorial);
           setIsGenerating(false);
           eventSource.close();

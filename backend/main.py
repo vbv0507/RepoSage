@@ -22,7 +22,7 @@ from services.redis_service import cache_service
 from services.chroma_service import check_chroma_connection
 from services.llm_provider import check_config_status
 from services.ast_parser import CODE_EXTENSIONS, IGNORED_DIRS, is_ignored_file
-from services.rag_service import UPLOAD_REPO_PREFIX, resolve_repo_path, ingest_codebase, query_codebase
+from services.rag_service import UPLOAD_REPO_PREFIX, resolve_repo_path, ingest_codebase, query_codebase, stream_query_codebase
 from services.tutorial_generator import stream_full_tutorial, get_cached_tutorial
 from services.queue_service import add_email_pdf_job, get_job_status
 
@@ -32,14 +32,27 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Enable CORS for React frontend & browser extensions
+# Configure CORS: allow_credentials=False avoids spec violations with wildcard/permissive origins
+raw_allowed_origins = os.getenv("ALLOWED_ORIGINS", "")
+if raw_allowed_origins.strip():
+    allowed_origins = [origin.strip() for origin in raw_allowed_origins.split(",") if origin.strip()]
+else:
+    allowed_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"^https:\/\/reposage-frontend\..*",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Request Models
 class IngestRequest(BaseModel):
@@ -240,6 +253,69 @@ async def chat_endpoint(req: ChatRequest):
     except Exception as e:
         logger.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/chat-stream")
+async def chat_stream_post(req: ChatRequest):
+    try:
+        resolved = resolve_repo_path(req.repoPath) if req.repoPath else None
+
+        async def event_generator():
+            try:
+                async for event in stream_query_codebase(
+                    repo_path=resolved,
+                    question=req.question,
+                    refresh=bool(req.refresh)
+                ):
+                    yield f"data: {json.dumps(event)}\n\n"
+            except Exception as exc:
+                logger.error(f"Chat stream generator error: {exc}", exc_info=True)
+                yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Chat stream error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat-stream")
+async def chat_stream_get(
+    question: str = Query(..., description="Developer question"),
+    repoPath: Optional[str] = Query(None, description="Repository path or URL"),
+    refresh: Optional[bool] = Query(False)
+):
+    try:
+        resolved = resolve_repo_path(repoPath) if repoPath else None
+
+        async def event_generator():
+            try:
+                async for event in stream_query_codebase(
+                    repo_path=resolved,
+                    question=question,
+                    refresh=bool(refresh)
+                ):
+                    yield f"data: {json.dumps(event)}\n\n"
+            except Exception as exc:
+                logger.error(f"Chat stream generator error: {exc}", exc_info=True)
+                yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Chat stream error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/graph")
 async def graph_endpoint(path: str = Query(..., description="Repository path or URL")):

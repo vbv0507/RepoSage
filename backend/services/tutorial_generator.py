@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import asyncio
 from typing import List, Dict, Any, Callable, Optional
 
 from .llm_provider import get_chat_model
@@ -11,6 +12,7 @@ try:
     from utils.mermaid_cleaner import clean_mermaid_in_markdown
 except ImportError:
     from ..utils.mermaid_cleaner import clean_mermaid_in_markdown
+
 
 
 logger = logging.getLogger("tutorial_generator")
@@ -159,40 +161,29 @@ def get_repo_overview(repo_path: str) -> Dict[str, Any]:
 async def get_cached_tutorial(repo_path: str) -> Optional[Dict[str, Any]]:
     return await cache_service.get(f"tutorial:{repo_path}")
 
-async def stream_full_tutorial(
+async def _generate_chapter(
+    cfg: Dict[str, Any],
+    chapter_index: int,
+    total_chapters: int,
     repo_path: str,
-    on_event: Callable[[Dict[str, Any]], None]
+    repo_name: str,
+    overview: Dict[str, Any],
+    chat_model: Any,
+    semaphore: asyncio.Semaphore,
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> Dict[str, Any]:
-    cached = await get_cached_tutorial(repo_path)
-    if cached and cached.get("chapters") and len(cached["chapters"]) == len(CHAPTERS_CONFIG):
-        on_event({"step": "cached", "message": "Serving cached 10-chapter architectural blueprint...", "tutorial": cached})
-        return cached
-
-    repo_name = os.path.basename(repo_path)
-    overview = get_repo_overview(repo_path)
-    total_chapters = len(CHAPTERS_CONFIG)
-
-    on_event({
-        "step": "start",
-        "message": f"Starting 10-chapter publication-grade architectural blueprint for {repo_name}...",
-        "totalChapters": total_chapters,
-        "repoName": repo_name
-    })
-
-    chapters = []
-    chat_model = get_chat_model(temperature=0.2)
-
-    for i, cfg in enumerate(CHAPTERS_CONFIG):
-        ch_idx = i + 1
-        on_event({
-            "step": "chapter_start",
-            "chapterIndex": ch_idx,
-            "totalChapters": total_chapters,
-            "chapterId": cfg["id"],
-            "title": cfg["title"],
-            "subtitle": cfg["subtitle"],
-            "message": f"Drafting Chapter {ch_idx}/{total_chapters}: {cfg['title']}..."
-        })
+    """Execute retrieval, prompt construction, and LLM inference for one chapter under semaphore cap."""
+    async with semaphore:
+        if on_event:
+            on_event({
+                "step": "chapter_start",
+                "chapterIndex": chapter_index,
+                "totalChapters": total_chapters,
+                "chapterId": cfg["id"],
+                "title": cfg["title"],
+                "subtitle": cfg["subtitle"],
+                "message": f"Drafting Chapter {chapter_index}/{total_chapters}: {cfg['title']}..."
+            })
 
         # Dual-retrieval
         search_res = await search_codebase(repo_path=repo_path, question=cfg["query"], top_k=6)
@@ -212,7 +203,7 @@ async def stream_full_tutorial(
         diff_context = "\n\n".join(diff_snippets)
 
         prompt = (
-            f"You are the Lead Architect drafting Chapter {ch_idx} of a 10-Chapter Technical Blueprint for: {repo_name}\n\n"
+            f"You are the Lead Architect drafting Chapter {chapter_index} of a 10-Chapter Technical Blueprint for: {repo_name}\n\n"
             f"CHAPTER: {cfg['title']}\n"
             f"THEME: {cfg['subtitle']}\n\n"
             f"Repository Overview:\nTop Files: {', '.join(overview['topLevelFiles'][:15])}\n\n"
@@ -236,23 +227,68 @@ async def stream_full_tutorial(
             raw_content = str(response.content)
         cleaned_content = clean_mermaid_in_markdown(raw_content)
 
-
         chapter_obj = {
             "id": cfg["id"],
-            "chapterIndex": ch_idx,
+            "chapterIndex": chapter_index,
             "title": cfg["title"],
             "subtitle": cfg["subtitle"],
             "content": cleaned_content
         }
-        chapters.append(chapter_obj)
 
-        on_event({
-            "step": "chapter_done",
-            "chapterIndex": ch_idx,
-            "totalChapters": total_chapters,
-            "chapter": chapter_obj,
-            "message": f"Completed Chapter {ch_idx}/{total_chapters}: {cfg['title']}"
-        })
+        if on_event:
+            on_event({
+                "step": "chapter_done",
+                "chapterIndex": chapter_index,
+                "totalChapters": total_chapters,
+                "chapter": chapter_obj,
+                "message": f"Completed Chapter {chapter_index}/{total_chapters}: {cfg['title']}"
+            })
+
+        return chapter_obj
+
+
+async def stream_full_tutorial(
+    repo_path: str,
+    on_event: Callable[[Dict[str, Any]], None]
+) -> Dict[str, Any]:
+    cached = await get_cached_tutorial(repo_path)
+    if cached and cached.get("chapters") and len(cached["chapters"]) == len(CHAPTERS_CONFIG):
+        on_event({"step": "cached", "message": "Serving cached 10-chapter architectural blueprint...", "tutorial": cached})
+        return cached
+
+    repo_name = os.path.basename(repo_path)
+    overview = get_repo_overview(repo_path)
+    total_chapters = len(CHAPTERS_CONFIG)
+
+    on_event({
+        "step": "start",
+        "message": f"Starting 10-chapter publication-grade architectural blueprint for {repo_name}...",
+        "totalChapters": total_chapters,
+        "repoName": repo_name
+    })
+
+    # Run chapters concurrently with a concurrency cap of 3
+    semaphore = asyncio.Semaphore(3)
+    chat_model = get_chat_model(temperature=0.2)
+
+    tasks = [
+        _generate_chapter(
+            cfg=cfg,
+            chapter_index=i + 1,
+            total_chapters=total_chapters,
+            repo_path=repo_path,
+            repo_name=repo_name,
+            overview=overview,
+            chat_model=chat_model,
+            semaphore=semaphore,
+            on_event=on_event
+        )
+        for i, cfg in enumerate(CHAPTERS_CONFIG)
+    ]
+
+    chapters = await asyncio.gather(*tasks)
+    # Ensure assembled chapters are strictly sorted by chapterIndex regardless of completion order
+    chapters.sort(key=lambda c: c["chapterIndex"])
 
     # Assemble full markdown book
     full_md_parts = [
@@ -280,3 +316,4 @@ async def stream_full_tutorial(
     })
 
     return full_tutorial
+
