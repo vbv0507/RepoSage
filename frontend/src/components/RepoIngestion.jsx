@@ -34,8 +34,12 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo, backend
   const retryCountRef = useRef(0);
   const retryTimerRef = useRef(null);
   const isRetryRef = useRef(false);
-  const MAX_RETRIES = 3;
-  const RETRY_DELAY_MS = 10000;
+  // 6 × 15s = 90s total retry budget, covering realistic cold-start times of 45-75s.
+  // The health-check poll (every 8s in App.jsx) will re-enable the button automatically
+  // once the container wakes, so the user won't sit through the full 90s in the normal
+  // case — this budget only matters if they click Analyze during the wake window.
+  const MAX_RETRIES = 6;
+  const RETRY_DELAY_MS = 15000;
 
   useEffect(() => {
     if (activeRepo) {

@@ -20,17 +20,22 @@ export default function App() {
 
   const fetchHealth = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(25000) });
+      // 8s per-request timeout: fail fast so the 8s polling loop actually retries
+      // rather than one 25s hung request consuming the entire poll window.
+      const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(8000) });
       if (res.ok) {
         const data = await res.json();
         setHealth(data);
         setBackendReady(true);
       } else {
+        // A real non-ok HTTP response (e.g. 500) — backend is up but broken.
         setBackendReady(false);
       }
     } catch (e) {
+      // Network error or timeout — container not yet awake.
+      // Do NOT reset backendReady to false here: once the backend came up
+      // successfully, transient poll failures should not re-disable the button.
       console.warn('Backend not responding yet:', e.message);
-      setBackendReady(false);
     }
   };
 
