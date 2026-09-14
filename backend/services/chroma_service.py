@@ -12,9 +12,11 @@ import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 import chromadb.utils.embedding_functions as chromadb_ef
 
+import socket
+
 logger = logging.getLogger("chroma_service")
 
-CHROMA_URL = os.getenv("CHROMA_URL", "http://localhost:8000")
+CHROMA_URL = os.getenv("CHROMA_URL", "").strip()
 
 class ResilientEmbeddingFunction(EmbeddingFunction):
     """
@@ -109,20 +111,23 @@ def get_chroma_client():
     if _client is not None:
         return _client
 
-    # Try connecting to remote/local HTTP server
-    try:
-        if CHROMA_URL.startswith("http"):
+    # Try connecting to remote/local HTTP server only if CHROMA_URL is explicitly configured
+    if CHROMA_URL and CHROMA_URL.lower() not in ("none", "false", "local", "disabled") and CHROMA_URL.startswith("http"):
+        try:
             parts = CHROMA_URL.replace("http://", "").replace("https://", "").split(":")
             host = parts[0]
             port = int(parts[1]) if len(parts) > 1 else 8000
+            # Fast TCP socket check with 2s timeout to prevent 30-60s OS TCP connection hang
+            with socket.create_connection((host, port), timeout=2.0):
+                pass
             client = chromadb.HttpClient(host=host, port=port)
             client.heartbeat()
             _client = client
             return _client
-    except Exception as e:
-        logger.info(f"[ChromaDB] HTTP ChromaDB not reachable at {CHROMA_URL}: {e}. Initializing persistent local DB.")
+        except Exception as e:
+            logger.info(f"[ChromaDB] HTTP ChromaDB not reachable at {CHROMA_URL}: {e}. Initializing persistent local DB.")
 
-    # Fallback to local persistent storage
+    # Fallback to local persistent storage immediately
     persist_dir = os.path.abspath("./chroma_data")
     os.makedirs(persist_dir, exist_ok=True)
     _client = chromadb.PersistentClient(path=persist_dir)

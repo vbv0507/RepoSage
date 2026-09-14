@@ -26,6 +26,7 @@ export default function App() {
   // The interval ref lets us swap cadence without unmounting.
   const intervalRef = useRef(null);
   const backendReadyRef = useRef(false); // mirror for use inside interval callbacks
+  const inFlightRef = useRef(false);
 
   const startPolling = (cadenceMs) => {
     if (intervalRef.current) clearInterval(intervalRef.current);
@@ -39,9 +40,12 @@ export default function App() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const fetchHealth = async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
-      // 8s per-request timeout: fail fast so the polling loop retries at cadence.
-      const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(8000) });
+      // 20s per-request timeout: gives Azure scale-to-zero cold-starts (12-18s) enough time to wake up
+      // without prematurely aborting and staying stuck in disabled state.
+      const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(20000) });
       if (res.ok) {
         const data = await res.json();
         failStreakRef.current = 0; // reset streak on success
@@ -71,6 +75,8 @@ export default function App() {
         setBackendReady(false);
         startPolling(8000);
       }
+    } finally {
+      inFlightRef.current = false;
     }
   };
 
