@@ -360,13 +360,7 @@ def parse_code_file(file_path: str, repo_path: str) -> Dict[str, Any]:
         if ast_warning:
             warnings.append(ast_warning)
     elif ext in {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}:
-        ts_chunks, ts_warning = _parse_js_ts_treesitter(content, rel_path, ext)
-        if ts_chunks:
-            chunks = ts_chunks
-        else:
-            if ts_warning:
-                warnings.append(ts_warning)
-            chunks = _parse_js_ts_functions(content, rel_path)
+        chunks = _parse_js_ts_functions(content, rel_path)
 
     # If no structural symbols were found, use standard line-based chunks
     if not chunks:
