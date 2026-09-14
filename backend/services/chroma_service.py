@@ -123,19 +123,18 @@ def get_chroma_client():
     if _client is not None:
         return _client
 
-    # Try connecting to remote/local HTTP server only if CHROMA_URL is explicitly configured
-    if CHROMA_URL and CHROMA_URL.lower() not in ("none", "false", "local", "disabled") and CHROMA_URL.startswith("http"):
+    # Try connecting to remote/local HTTP server only if CHROMA_URL is explicitly configured and not an unreachable Docker-compose hostname
+    if CHROMA_URL and CHROMA_URL.lower() not in ("none", "false", "local", "disabled", "http://chroma:8000") and not CHROMA_URL.startswith("http://chroma") and CHROMA_URL.startswith("http"):
         try:
-            parts = CHROMA_URL.replace("http://", "").replace("https://", "").split(":")
-            host = parts[0]
-            port = int(parts[1]) if len(parts) > 1 else 8000
-            # Fast TCP socket check with 2s timeout to prevent 30-60s OS TCP connection hang
-            with socket.create_connection((host, port), timeout=2.0):
-                pass
-            client = chromadb.HttpClient(host=host, port=port)
-            client.heartbeat()
-            _client = client
-            return _client
+            # Fast HTTP heartbeat check with 1.5s timeout to prevent thread freezes
+            hb_resp = requests.get(f"{CHROMA_URL.rstrip('/')}/api/v1/heartbeat", timeout=1.5)
+            if hb_resp.status_code == 200:
+                parts = CHROMA_URL.replace("http://", "").replace("https://", "").split(":")
+                host = parts[0]
+                port = int(parts[1]) if len(parts) > 1 else 8000
+                client = chromadb.HttpClient(host=host, port=port)
+                _client = client
+                return _client
         except Exception as e:
             logger.info(f"[ChromaDB] HTTP ChromaDB not reachable at {CHROMA_URL}: {e}. Initializing persistent local DB.")
 
