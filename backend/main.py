@@ -257,7 +257,8 @@ async def ingest_stream(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
         }
     )
 
@@ -307,7 +308,8 @@ async def chat_stream_post(req: ChatRequest):
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive"
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
             }
         )
     except Exception as e:
@@ -340,7 +342,8 @@ async def chat_stream_get(
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive"
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
             }
         )
     except Exception as e:
@@ -480,7 +483,8 @@ async def tutorial_stream(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
         }
     )
 

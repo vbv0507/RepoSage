@@ -21,50 +21,62 @@ CHROMA_URL = os.getenv("CHROMA_URL", "").strip()
 class ResilientEmbeddingFunction(EmbeddingFunction):
     """
     Resilient multi-tier embedding function:
-    1. Google Gemini Embeddings (models/text-embedding-004) with retry and backoff
-    2. Local ONNX DefaultEmbeddingFunction (all-MiniLM-L6-v2) fallback
-    3. Deterministic normalized hash vector emergency fallback (zero crashes)
+    1. Google Gemini Embeddings (models/gemini-embedding-001 with 384 dim, fallback to models/text-embedding-004)
+    2. Local ONNX DefaultEmbeddingFunction (all-MiniLM-L6-v2, 384 dim) with concurrency guard
+    3. Deterministic normalized hash vector emergency fallback (384 dim, zero crashes)
     """
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+        self.preferred_model = None
+        self._onnx_lock = threading.Lock()
 
     def __call__(self, input: Documents) -> Embeddings:
-        # 1. Try Gemini Cloud Embeddings (with 1 retry after 300ms)
+        # 1. Try Gemini Cloud Embeddings with 384 dimensions
         if self.api_key:
-            requests_data = [
-                {
-                    "model": "models/text-embedding-004",
-                    "content": {"parts": [{"text": (text or "")[:2048]}]}
-                }
-                for text in input
-            ]
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={self.api_key}"
-            
-            for attempt in range(2):
-                try:
-                    resp = requests.post(url, json={"requests": requests_data}, timeout=(5, 10))
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if "embeddings" in data and len(data["embeddings"]) > 0:
-                            return [e["values"] for e in data["embeddings"]]
-                    else:
-                        logger.warning(f"[ChromaDB] Gemini embedding attempt {attempt + 1} returned status {resp.status_code}")
-                except Exception as e:
-                    logger.warning(f"[ChromaDB] Gemini embedding attempt {attempt + 1} failed: {e}")
-                
-                if attempt == 0:
-                    time.sleep(0.3)
+            candidate_models = [self.preferred_model] if self.preferred_model else ["models/gemini-embedding-001", "models/text-embedding-004"]
+            for model_name in candidate_models:
+                if not model_name:
+                    continue
+                requests_data = [
+                    {
+                        "model": model_name,
+                        "content": {"parts": [{"text": (text or "")[:2048]}]},
+                        "outputDimensionality": 384
+                    }
+                    for text in input
+                ]
+                url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:batchEmbedContents?key={self.api_key}"
+                for attempt in range(2):
+                    resp = None
+                    try:
+                        resp = requests.post(url, json={"requests": requests_data}, timeout=(5, 12))
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if "embeddings" in data and len(data["embeddings"]) > 0:
+                                self.preferred_model = model_name
+                                return [e["values"] for e in data["embeddings"]]
+                        elif resp.status_code == 404:
+                            break  # Try next candidate model
+                        else:
+                            logger.warning(f"[ChromaDB] Gemini {model_name} attempt {attempt + 1} returned status {resp.status_code}")
+                    except Exception as e:
+                        logger.warning(f"[ChromaDB] Gemini {model_name} attempt {attempt + 1} failed: {e}")
+                    
+                    if attempt == 0:
+                        wait_time = 1.2 if (resp is not None and resp.status_code == 429) else 0.3
+                        time.sleep(wait_time)
 
-        # 2. Resilient Local ONNX Embedding Fallback (DefaultEmbeddingFunction)
+        # 2. Resilient Local ONNX Embedding Fallback (all-MiniLM-L6-v2) - Thread-locked to avoid CPU/OOM spikes
         try:
-            logger.warning("[ChromaDB] Gemini embedding unavailable. Falling back to local ONNX embeddings (all-MiniLM-L6-v2).")
-            local_ef = get_local_query_embedding_function()
-            if local_ef is not None and not isinstance(local_ef, ResilientEmbeddingFunction):
-                return local_ef(input)
+            with self._onnx_lock:
+                logger.warning("[ChromaDB] Gemini embedding unavailable. Falling back to local ONNX embeddings (all-MiniLM-L6-v2).")
+                local_ef = get_local_query_embedding_function()
+                if local_ef is not None and not isinstance(local_ef, ResilientEmbeddingFunction):
+                    return local_ef(input)
         except Exception as onnx_err:
             logger.warning(f"[ChromaDB] Local ONNX fallback failed: {onnx_err}. Using emergency hash vectors.")
 
-        # 3. Emergency Normalized Hash Vector (384 dimensions)
+        # 3. Emergency Normalized Hash Vector (384 dimensions matching collection dimension)
         results = []
         for text in input:
             vec = [0.0] * 384
@@ -137,7 +149,7 @@ def check_chroma_connection() -> dict:
     try:
         c = get_chroma_client()
         hb = c.heartbeat()
-        return {"connected": True, "heartbeat": hb, "embeddingType": "Gemini-004 + Resilient Hash + Local ONNX"}
+        return {"connected": True, "heartbeat": hb, "embeddingType": "Gemini-001 + Resilient Hash + Local ONNX"}
     except Exception as e:
         return {"connected": False, "error": str(e)}
 
@@ -179,8 +191,7 @@ def get_diffs_collection():
 def get_queries_collection():
     global _queries_collection
     if _queries_collection is None:
-        local_ef = get_local_query_embedding_function()
-        _queries_collection = _get_or_init_collection("reposage_queries", embedding_fn=local_ef)
+        _queries_collection = _get_or_init_collection("reposage_queries", embedding_fn=get_embedding_function())
     return _queries_collection
 
 
@@ -259,7 +270,7 @@ async def find_relevant_files(repo_path: str, index_id: Optional[str] = None, qu
         logger.warning("File-profile routing failed: %s", exc)
         return []
 
-async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]], index_id: str, clear_prior: bool = False) -> dict:
+async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]], index_id: str, clear_prior: bool = False, on_progress: Optional[Any] = None) -> dict:
     if not chunks:
         return {"storedCount": 0, "failedFiles": []}
     coll = get_code_collection()
@@ -299,7 +310,7 @@ async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]], index_
             "summary": (chunk.get("summary") or "")[:400]
         })
 
-    # Parallel batch add via asyncio.gather and asyncio.to_thread
+    # Sequential batch add to prevent memory & CPU spikes in container environments
     BATCH_SIZE = 50
     failed_files = []
     batches = []
@@ -320,11 +331,21 @@ async def store_code_chunks(repo_path: str, chunks: List[Dict[str, Any]], index_
             batch_fails = [{"path": fp, "reason": f"embedding_error: {exc}"} for fp in affected_files]
             return 0, batch_fails
 
-    results = await asyncio.gather(*[_add_batch(b[0], b[1], b[2]) for b in batches])
-    stored_count = sum(r[0] for r in results)
-    for r in results:
-        if r[1]:
-            failed_files.extend(r[1])
+    stored_count = 0
+    for idx, b in enumerate(batches):
+        count, fails = await _add_batch(b[0], b[1], b[2])
+        stored_count += count
+        if fails:
+            failed_files.extend(fails)
+        if on_progress:
+            processed = min((idx + 1) * BATCH_SIZE, len(ids))
+            on_progress({
+                "step": "embedding_progress",
+                "current": processed,
+                "total": len(ids),
+                "message": f"Indexed {processed}/{len(ids)} code chunks into vector database..."
+            })
+        await asyncio.sleep(0.01)
 
     return {"storedCount": stored_count, "failedFiles": failed_files}
 

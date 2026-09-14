@@ -397,7 +397,7 @@ async def ingest_codebase(
     # Store in ChromaDB reposage_code
     if new_chunks:
         notify({"step": "storing_code", "message": f"Indexing and storing {len(new_chunks)} code blocks into vector database..."})
-        storage_result = await store_code_chunks(repo_path, new_chunks, index_id, clear_prior=clear_prior)
+        storage_result = await store_code_chunks(repo_path, new_chunks, index_id, clear_prior=clear_prior, on_progress=notify)
         if storage_result.get("failedFiles"):
             ingestion_report["embeddingFailures"] = storage_result["failedFiles"]
             ingestion_report["skippedFiles"].extend(storage_result["failedFiles"])
