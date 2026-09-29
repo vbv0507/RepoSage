@@ -54,6 +54,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount Spider AI Agent Control Plane
+from routes.agent_routes import router as agent_router
+app.include_router(agent_router, prefix="/api/agent")
+
 
 # Request Models
 class IngestRequest(BaseModel):
