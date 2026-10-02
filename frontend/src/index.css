@@ -295,59 +295,17 @@ html, body, #root {
   min-height: 320px;
 }
 
-/* Tutorial Layout Responsive */
-.grid-tutorial {
-  display: grid;
-  grid-template-columns: 280px 1fr;
-  gap: 16px;
-  align-items: start;
-}
-
-.tutorial-reader-pane {
-  padding: 28px 32px;
-  box-sizing: border-box;
-}
-
-/* Mermaid SVG Responsive Wrapper */
-.mermaid-diagram-container {
-  width: 100%;
-  max-width: 100%;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-  padding: 14px;
-  background-color: #0c0c0e;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  margin: 14px 0;
-  box-sizing: border-box;
-}
-
-.mermaid-diagram-container svg {
-  max-width: 100%;
-  height: auto !important;
-  display: block;
-  margin: 0 auto;
-}
-
 /* ==========================================================================
    Breakpoints
    ========================================================================== */
 
 /* Tablets & Small Laptops (<= 1024px) */
 @media (max-width: 1024px) {
-  .grid-tutorial {
-    grid-template-columns: 1fr;
-    gap: 12px;
-  }
-
   .grid-dependencies {
     grid-template-columns: 1fr;
     gap: 12px;
   }
 
-  .tutorial-reader-pane {
-    padding: 20px 24px;
-  }
 }
 
 /* Mobile Devices (<= 640px) */
@@ -419,10 +377,6 @@ html, body, #root {
     height: calc(100dvh - 200px);
     min-height: 420px;
     margin-bottom: 14px;
-  }
-
-  .tutorial-reader-pane {
-    padding: 16px 12px;
   }
 
   .tab-bar-container {

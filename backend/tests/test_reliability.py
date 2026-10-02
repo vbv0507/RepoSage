@@ -12,10 +12,6 @@ from services import (
     chroma_service,
     rag_service,
     git_archaeology,
-    tutorial_generator,
-    pdf_service,
-    mail_service,
-    queue_service,
 )
 from services.ast_parser import (
     scan_directory_with_report,
@@ -314,81 +310,6 @@ class ReliabilityTests(unittest.TestCase):
             self.assertTrue(commits[0]["hash"])
             self.assertIn("v2", commits[0]["diffSnippet"])
             self.assertIn("Feature update", commits[0]["intentSummary"])
-
-    def test_tutorial_generator_chapters_config_and_cache(self):
-        self.assertEqual(len(tutorial_generator.CHAPTERS_CONFIG), 10)
-        cached_data = {
-            "repoName": "test-repo",
-            "repoPath": "some/path",
-            "totalChapters": 10,
-            "chapters": [{"chapterIndex": i, "title": f"Ch {i}", "subtitle": "sub", "content": "body"} for i in range(1, 11)],
-            "fullMarkdown": "# Blueprint"
-        }
-        events = []
-        with patch.object(tutorial_generator, "get_cached_tutorial", new=AsyncMock(return_value=cached_data)), \
-             patch.object(tutorial_generator, "get_chat_model") as mock_chat:
-            result = asyncio.run(tutorial_generator.stream_full_tutorial("some/path", on_event=events.append))
-            self.assertEqual(result["totalChapters"], 10)
-            mock_chat.assert_not_called()
-            self.assertEqual(events[0]["step"], "cached")
-
-    def test_pdf_service_generation_and_text_sanitizer(self):
-        raw = "Hello & <World> \x00\x1f\u2603"
-        clean = pdf_service.sanitize_text(raw)
-        self.assertIn("&amp;", clean)
-        self.assertIn("&lt;", clean)
-        self.assertIn("&gt;", clean)
-        self.assertNotIn("\x00", clean)
-        self.assertNotIn("\u2603", clean)
-
-        dummy_tutorial = {
-            "repoName": "SampleRepo",
-            "chapters": [
-                {
-                    "chapterIndex": 1,
-                    "title": "1. System Overview",
-                    "subtitle": "Architecture Topology",
-                    "content": "### Architecture\nThis is a test blueprint.\n```mermaid\ngraph TD\nA-->B\n```"
-                }
-            ]
-        }
-        pdf_bytes = pdf_service.generate_tutorial_pdf(dummy_tutorial)
-        self.assertIsInstance(pdf_bytes, bytes)
-        self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
-        self.assertGreater(len(pdf_bytes), 500)
-
-    def test_mail_service_simulated_delivery_when_unconfigured(self):
-        with patch.dict(os.environ, {"EMAIL_USER": "", "SMTP_USER": ""}, clear=False):
-            res = asyncio.run(mail_service.send_tutorial_email("developer@example.com", "TestRepo", b"%PDF-mock"))
-            self.assertTrue(res["delivered"])
-            self.assertTrue(res["simulated"])
-            self.assertTrue(res["messageId"].startswith("sim_"))
-
-    def test_queue_service_lifecycle_transitions(self):
-        dummy_tut = {"repoName": "DemoRepo", "chapters": [{"chapterIndex": 1, "title": "Ch1", "content": "body"}]}
-        with patch.object(queue_service, "get_cached_tutorial", new=AsyncMock(return_value=dummy_tut)), \
-             patch.object(queue_service, "generate_tutorial_pdf", return_value=b"%PDF-demo"), \
-             patch.object(queue_service, "send_tutorial_email", new=AsyncMock(return_value={"delivered": True, "messageId": "msg_123"})):
-
-            async def run_queue_flow():
-                queued = await queue_service.add_email_pdf_job("repo/path", "user@example.com")
-                job_id = queued["jobId"]
-                self.assertTrue(job_id.startswith("mem_"))
-
-                # Poll until background worker completes execution
-                status = None
-                for _ in range(25):
-                    status = await queue_service.get_job_status(job_id)
-                    if status["state"] in ("completed", "failed"):
-                        break
-                    await asyncio.sleep(0.02)
-
-                self.assertIsNotNone(status)
-                self.assertEqual(status["state"], "completed")
-                self.assertEqual(status["progress"], 100)
-                self.assertEqual(status["result"]["messageId"], "msg_123")
-
-            asyncio.run(run_queue_flow())
 
     def test_main_routes_and_security(self):
         # 1. Test _safe_uploaded_file_path security

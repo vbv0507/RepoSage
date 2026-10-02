@@ -3,14 +3,13 @@ import Header from './components/Header';
 import RepoIngestion from './components/RepoIngestion';
 import ArchitectureGraph from './components/ArchitectureGraph';
 import ChatCopilot from './components/ChatCopilot';
-import CodeTutorial from './components/CodeTutorial';
 import { API_BASE } from './config';
 
 export default function App() {
   const [health, setHealth] = useState(null);
   const [backendReady, setBackendReady] = useState(false);
   const [activeRepo, setActiveRepo] = useState('https://github.com/vbv0507/RepoSage');
-  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'graph' | 'tutorial'
+  const [activeTab, setActiveTab] = useState('chat');
 
   // Consecutive-failure streak counter.
   // - Increments on each catch (timeout / network error).
@@ -122,17 +121,6 @@ export default function App() {
             Module Dependencies
           </button>
 
-          <button
-            onClick={() => setActiveTab('tutorial')}
-            className={`btn tab-btn`}
-            style={{
-              backgroundColor: activeTab === 'tutorial' ? '#27272a' : 'transparent',
-              color: activeTab === 'tutorial' ? 'var(--text-primary)' : 'var(--text-muted)',
-              fontSize: '13px'
-            }}
-          >
-            Architecture Tutorial
-          </button>
         </div>
 
         {/* Tab Content — always mounted, visibility toggled via CSS to preserve state across tab switches */}
@@ -141,9 +129,6 @@ export default function App() {
         </div>
         <div style={{ display: activeTab === 'graph' ? 'block' : 'none' }}>
           <ArchitectureGraph activeRepo={activeRepo} />
-        </div>
-        <div style={{ display: activeTab === 'tutorial' ? 'block' : 'none' }}>
-          <CodeTutorial activeRepo={activeRepo} />
         </div>
       </main>
     </div>

@@ -7,7 +7,7 @@ import uuid
 import time
 from pathlib import PurePosixPath
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -24,8 +24,6 @@ from services.chroma_service import check_chroma_connection
 from services.llm_provider import check_config_status
 from services.ast_parser import CODE_EXTENSIONS, IGNORED_DIRS, is_ignored_file
 from services.rag_service import UPLOAD_REPO_PREFIX, resolve_repo_path, ingest_codebase, query_codebase, stream_query_codebase
-from services.tutorial_generator import stream_full_tutorial, get_cached_tutorial
-from services.queue_service import add_email_pdf_job, get_job_status
 
 app = FastAPI(
     title="RepoSage AI Engine",
@@ -68,13 +66,6 @@ class ChatRequest(BaseModel):
     repoPath: Optional[str] = None
     question: str
     refresh: Optional[bool] = False
-
-class TutorialExportRequest(BaseModel):
-    repoPath: str
-
-class EmailPdfRequest(BaseModel):
-    repoPath: str
-    email: str
 
 # 30 days retention TTL in Redis.
 # LIMITATION NOTE: Redis acts as an ephemeral caching tier; conversation history is not indefinitely persistent.
@@ -447,116 +438,6 @@ async def graph_endpoint(path: str = Query(..., description="Repository path or 
         return graph or {"nodes": [], "links": []}
     except Exception as e:
         logger.error(f"Graph error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/tutorial-stream")
-async def tutorial_stream(
-    path: str = Query(..., description="Repository path or URL"),
-    refresh: Optional[bool] = Query(False)
-):
-    async def event_generator():
-        queue = asyncio.Queue()
-
-        def on_event(data: dict):
-            queue.put_nowait(data)
-
-        async def worker():
-            try:
-                resolved = resolve_repo_path(path)
-                if refresh:
-                    await cache_service.delete(f"tutorial:{resolved}")
-                await stream_full_tutorial(resolved, on_event=on_event)
-            except Exception as e:
-                logger.error(f"Tutorial stream error: {e}", exc_info=True)
-                on_event({"step": "error", "error": str(e)})
-            finally:
-                on_event({"__done__": True})
-
-        task = asyncio.create_task(worker())
-
-        while True:
-            item = await queue.get()
-            if "__done__" in item:
-                break
-            yield f"data: {json.dumps(item)}\n\n"
-
-        await task
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
-
-@app.get("/api/tutorial")
-async def get_tutorial(path: str = Query(...)):
-    try:
-        resolved = resolve_repo_path(path)
-        cached = await get_cached_tutorial(resolved)
-        if not cached:
-            raise HTTPException(status_code=404, detail="No tutorial generated yet for this repository.")
-        return cached
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/tutorial/export")
-async def export_tutorial(req: TutorialExportRequest):
-    try:
-        resolved = resolve_repo_path(req.repoPath)
-        cached = await get_cached_tutorial(resolved)
-        if not cached or not cached.get("fullMarkdown"):
-            raise HTTPException(status_code=404, detail="Please generate the tutorial first before exporting.")
-
-        repo_name = cached.get("repoName", "architecture")
-        filename = f"{repo_name}_tutorial.md"
-        
-        return Response(
-            content=cached["fullMarkdown"],
-            media_type="text/markdown",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/tutorial/cache")
-async def clear_tutorial_cache(path: str = Query(...)):
-    try:
-        resolved = resolve_repo_path(path)
-        await cache_service.delete(f"tutorial:{resolved}")
-        return {"success": True, "message": f"Cache cleared for {resolved}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/tutorial/email")
-async def email_tutorial_endpoint(req: EmailPdfRequest):
-    try:
-        resolved = resolve_repo_path(req.repoPath)
-        job_info = await add_email_pdf_job(repo_path=resolved, email=req.email)
-        return {
-            "success": True,
-            "jobId": job_info["jobId"],
-            "queueType": job_info["queueType"],
-            "message": f"PDF generation and email dispatch queued in {job_info['queueType']}."
-        }
-    except Exception as e:
-        logger.error(f"Email queue error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/tutorial/email/status/{job_id}")
-async def job_status_endpoint(job_id: str):
-    try:
-        status = await get_job_status(job_id)
-        return status
-    except Exception as e:
-        logger.error(f"Job status error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
