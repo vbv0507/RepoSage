@@ -99,6 +99,11 @@ class MessagePayload(BaseModel):
 
 MAX_UPLOAD_FILES = 2000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
 
 
 def _safe_uploaded_file_path(filename: str) -> Optional[PurePosixPath]:
@@ -115,6 +120,30 @@ def _safe_uploaded_file_path(filename: str) -> Optional[PurePosixPath]:
     if is_ignored_file(basename) or not (extension in CODE_EXTENSIONS or basename in {"Dockerfile", "Makefile"}):
         return None
     return candidate
+
+
+def _sse_response(events):
+    """Create a consistently configured Server-Sent Events response."""
+    return StreamingResponse(events, media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+async def _chat_events(repo_path: Optional[str], question: str, refresh: bool):
+    """Turn a codebase answer stream into SSE messages for either chat route."""
+    try:
+        async for event in stream_query_codebase(
+            repo_path=repo_path,
+            question=question,
+            refresh=refresh,
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+    except Exception as exc:
+        logger.error("Chat stream generator error: %s", exc, exc_info=True)
+        yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+
+
+async def _chat_stream_response(repo_path: Optional[str], question: str, refresh: bool):
+    resolved_path = resolve_repo_path(repo_path) if repo_path else None
+    return _sse_response(_chat_events(resolved_path, question, refresh))
 
 @app.get("/api/health")
 async def health_check():
@@ -247,15 +276,7 @@ async def ingest_stream(
 
         await task
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
+    return _sse_response(event_generator())
 
 @app.post("/api/ingest")
 async def ingest_endpoint(req: IngestRequest):
@@ -284,29 +305,7 @@ async def chat_endpoint(req: ChatRequest):
 @app.post("/api/chat-stream")
 async def chat_stream_post(req: ChatRequest):
     try:
-        resolved = resolve_repo_path(req.repoPath) if req.repoPath else None
-
-        async def event_generator():
-            try:
-                async for event in stream_query_codebase(
-                    repo_path=resolved,
-                    question=req.question,
-                    refresh=bool(req.refresh)
-                ):
-                    yield f"data: {json.dumps(event)}\n\n"
-            except Exception as exc:
-                logger.error(f"Chat stream generator error: {exc}", exc_info=True)
-                yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
-        )
+        return await _chat_stream_response(req.repoPath, req.question, bool(req.refresh))
     except Exception as e:
         logger.error(f"Chat stream error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -318,29 +317,7 @@ async def chat_stream_get(
     refresh: Optional[bool] = Query(False)
 ):
     try:
-        resolved = resolve_repo_path(repoPath) if repoPath else None
-
-        async def event_generator():
-            try:
-                async for event in stream_query_codebase(
-                    repo_path=resolved,
-                    question=question,
-                    refresh=bool(refresh)
-                ):
-                    yield f"data: {json.dumps(event)}\n\n"
-            except Exception as exc:
-                logger.error(f"Chat stream generator error: {exc}", exc_info=True)
-                yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
-        )
+        return await _chat_stream_response(repoPath, question, bool(refresh))
     except Exception as e:
         logger.error(f"Chat stream error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
