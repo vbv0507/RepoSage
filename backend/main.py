@@ -192,7 +192,8 @@ async def simple_health_check():
 
 async def index_sample_repository_if_needed():
     """Warm an empty Chroma database without delaying health checks."""
-    if os.getenv("AUTO_INDEX_SAMPLE_REPO", "true").lower() not in {"1", "true", "yes"}:
+    default_auto_index = "false" if os.getenv("RENDER") else "true"
+    if os.getenv("AUTO_INDEX_SAMPLE_REPO", default_auto_index).lower() not in {"1", "true", "yes"}:
         return
     try:
         from services.chroma_service import get_code_collection
@@ -200,7 +201,7 @@ async def index_sample_repository_if_needed():
         if get_code_collection().count() > 0:
             return
         logger.info("Indexing the configured sample repository in the background.")
-        repo_path = await asyncio.to_thread(resolve_repo_path, SAMPLE_REPOSITORY_URL, clone_depth=1)
+        repo_path = await asyncio.to_thread(resolve_repo_path, SAMPLE_REPOSITORY_URL, clone_depth=100)
         await ingest_codebase(repo_path, max_source_files=SAMPLE_REPOSITORY_MAX_FILES)
     except Exception as exc:
         logger.warning("Sample repository indexing skipped: %s", exc)

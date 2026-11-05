@@ -1,7 +1,7 @@
 import os
 import logging
 from typing import List, Dict, Any
-from git import Repo
+from git import Repo, NULL_TREE
 from .llm_provider import get_chat_model
 
 logger = logging.getLogger("git_archaeology")
@@ -38,8 +38,13 @@ async def analyze_git_archaeology(repo_path: str, max_commits: int = 15) -> List
             # Get diff with parent
             diff_text = ""
             if commit.parents:
-                parent = commit.parents[0]
-                diffs = parent.diff(commit, create_patch=True)
+                try:
+                    parent = commit.parents[0]
+                    diffs = parent.diff(commit, create_patch=True)
+                except Exception as parent_error:
+                    # Shallow-clone boundaries can reference a missing parent.
+                    logger.warning("Git history boundary for %s; diffing against empty tree: %s", h, parent_error)
+                    diffs = commit.diff(NULL_TREE, create_patch=True)
                 patches = []
                 for d in diffs[:5]:
                     if d.diff:

@@ -4,6 +4,8 @@ import ntpath
 import logging
 import uuid
 import hashlib
+import threading
+import asyncio
 import socket
 import ipaddress
 import urllib.parse
@@ -26,9 +28,12 @@ logger = logging.getLogger("rag_service")
 WINDOWS_PATH = re.compile(r"^[a-zA-Z]:[\\\\/]")
 UPLOAD_REPO_PREFIX = "upload://"
 CLONED_REPO_ROOT = os.getenv("CLONED_REPO_ROOT", "/tmp/reposage_clones")
+MAX_CHUNKS_PER_REPO = int(os.getenv("MAX_CHUNKS_PER_REPO", "500"))
 SEMANTIC_CACHE_DIRECT_THRESHOLD = 0.88
 SEMANTIC_CACHE_OFFLINE_THRESHOLD = 0.80
 CONFIDENCE_HIGH_SIMILARITY_THRESHOLD = 0.80
+_index_locks: Dict[str, threading.Lock] = {}
+_index_locks_guard = threading.Lock()
 
 
 # Keep semantic-answer caching fully inactive on the Render free plan. Code
@@ -191,7 +196,7 @@ def validate_remote_git_url(url: str) -> None:
 def resolve_repo_path(
     input_path: str,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
-    clone_depth: int = 30,
+    clone_depth: int = 100,
 ) -> str:
     if not input_path:
         raise ValueError("Repository path or URL is required.")
@@ -228,6 +233,7 @@ def resolve_repo_path(
         try:
             repo = Repo(target_dir)
             origin = repo.remotes.origin
+            origin.fetch(depth=clone_depth)
             origin.pull()
             if on_progress:
                 on_progress({"step": "cloned", "message": f"Successfully updated {repo_name} to latest commit."})
@@ -288,7 +294,29 @@ def _asks_for_signature(question: str) -> bool:
     lowered = question.lower()
     return any(term in lowered for term in ("signature", "parameters", "arguments", "function name", "method name", "function does", "internals"))
 
+def _index_lock(repo_path: str) -> threading.Lock:
+    with _index_locks_guard:
+        return _index_locks.setdefault(os.path.abspath(repo_path), threading.Lock())
+
+
 async def ingest_codebase(
+    repo_path: str,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    force_refresh: bool = False,
+    max_source_files: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Serialize indexing work for each repository across HTTP and startup tasks."""
+    lock = _index_lock(repo_path)
+    if lock.locked() and on_progress:
+        on_progress({"step": "waiting", "message": "An index run for this repository is already active; waiting for it to finish."})
+    await asyncio.to_thread(lock.acquire)
+    try:
+        return await _ingest_codebase_unlocked(repo_path, on_progress, force_refresh, max_source_files)
+    finally:
+        lock.release()
+
+
+async def _ingest_codebase_unlocked(
     repo_path: str,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
     force_refresh: bool = False,
@@ -300,8 +328,28 @@ async def ingest_codebase(
 
     notify({"step": "scanning", "message": "Scanning directory tree and detecting programming languages..."})
     file_paths, ingestion_report = scan_directory_with_report(repo_path, max_files=max_source_files or 2000)
+    non_empty_paths = []
+    for file_path in file_paths:
+        try:
+            with open(file_path, encoding="utf-8", errors="ignore") as source:
+                non_empty_lines = sum(1 for line in source if line.strip())
+        except OSError:
+            non_empty_lines = 5
+        if non_empty_lines < 5:
+            ingestion_report["skippedFiles"].append({
+                "path": os.path.relpath(file_path, repo_path).replace("\\", "/"),
+                "reason": "near_empty_source",
+            })
+            continue
+        non_empty_paths.append(file_path)
+    file_paths = non_empty_paths
     if not file_paths:
         raise ValueError(f"No parseable source code files discovered in: {repo_path}")
+
+    from .chroma_service import get_embedding_status
+    embedding_start = get_embedding_status()
+    logger.info("Starting index for %s with %s embeddings", repo_path, embedding_start["backend"])
+    notify({"step": "embedding_backend", "backend": embedding_start["backend"], "message": f"Embedding backend: {embedding_start['backend']}"})
 
     index_id = _index_id(file_paths, repo_path)
     current_hashes = {
@@ -414,6 +462,15 @@ async def ingest_codebase(
         "truncated": ingestion_report["truncated"],
     }
 
+    if len(new_chunks) > MAX_CHUNKS_PER_REPO:
+        new_chunks = new_chunks[:MAX_CHUNKS_PER_REPO]
+        ingestion_report["truncated"] = True
+        ingestion_report["chunkLimit"] = MAX_CHUNKS_PER_REPO
+        ingestion_report.setdefault("warnings", []).append(
+            f"Code chunks were capped at {MAX_CHUNKS_PER_REPO} to protect embedding quota."
+        )
+
+    embedding_degraded = False
     # Store in ChromaDB reposage_code
     if new_chunks:
         notify({"step": "storing_code", "message": f"Indexing and storing {len(new_chunks)} code blocks into vector database..."})
@@ -425,6 +482,11 @@ async def ingest_codebase(
             ingestion_report["summary"]["skipped"] = len(ingestion_report["skippedFiles"])
             ingestion_report["summary"]["embeddingFailures"] = len(storage_result["failedFiles"])
             ingestion_report["summary"]["truncated"] = True
+            ingestion_report["embeddingStatus"] = "degraded"
+            embedding_degraded = True
+            ingestion_report.setdefault("warnings", []).append(
+                "Some code vectors were not stored because the configured embedding backend was unavailable."
+            )
             notify({"step": "warning", "message": f"{len(storage_result['failedFiles'])} source files could not be embedded; see Index coverage report."})
     elif clear_prior:
         await store_code_chunks(repo_path, [], index_id, clear_prior=True)
@@ -432,13 +494,19 @@ async def ingest_codebase(
     await cache_service.set(f"ingestion_report:{repo_path}", ingestion_report, 86400)
     await cache_service.set(f"file_hashes:{repo_path}", current_hashes, 86400 * 30)
 
-    if parsed_files:
-        await store_file_profiles(repo_path, parsed_files, index_id, clear_prior=clear_prior)
+    if parsed_files and not embedding_degraded:
+        indexed_files = {chunk.get("filePath") for chunk in new_chunks}
+        await store_file_profiles(
+            repo_path,
+            [parsed for parsed in parsed_files if parsed.get("filePath") in indexed_files],
+            index_id,
+            clear_prior=clear_prior,
+        )
 
     # Git Archaeology
     notify({"step": "git_archaeology", "message": "Performing Git Archaeology on recent commits..."})
     diffs = await analyze_git_archaeology(repo_path, max_commits=15)
-    if diffs:
+    if diffs and not embedding_degraded:
         notify({"step": "embedding_git", "message": f"Indexing {len(diffs)} historical Git diffs into vector database..."})
         await store_diff_summaries(repo_path, diffs, index_id)
 
@@ -448,6 +516,8 @@ async def ingest_codebase(
 
     notify({"step": "complete", "message": "Repository ingestion complete!"})
 
+    embedding_status = get_embedding_status()
+    logger.info("Index complete for %s using %s embeddings: %s successful calls, %s failed calls", repo_path, embedding_status["backend"], embedding_status["successfulCalls"], embedding_status["failedCalls"])
     return {
         "repoPath": repo_path,
         "indexId": index_id,
@@ -456,7 +526,8 @@ async def ingest_codebase(
         "gitDiffsCount": len(diffs) if diffs else 0,
         "graphNodesCount": len(graph.get("nodes", [])),
         "graphLinksCount": len(graph.get("links", [])),
-        "ingestionReport": ingestion_report
+        "ingestionReport": ingestion_report,
+        "embedding": embedding_status,
     }
 
 

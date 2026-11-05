@@ -6,6 +6,7 @@ import hashlib
 import logging
 import asyncio
 import threading
+import random
 import requests
 from typing import List, Dict, Any, Optional
 import chromadb
@@ -19,6 +20,10 @@ logger = logging.getLogger("chroma_service")
 
 CHROMA_PATH = os.getenv("CHROMA_PATH", "/tmp/chroma")
 
+
+class EmbeddingBackendUnavailable(RuntimeError):
+    """Raised instead of mixing incompatible embedding vector spaces."""
+
 class ResilientEmbeddingFunction(EmbeddingFunction):
     """
     Resilient multi-tier embedding function:
@@ -30,42 +35,101 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
         self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
         self.preferred_model = None
         self._onnx_lock = threading.Lock()
+        self._rate_lock = threading.Lock()
+        self._last_request_at = 0.0
+        self._stats_lock = threading.Lock()
+        self._successful_requests = 0
+        self._failed_requests = 0
+        self._embedded_documents = 0
+
+    def backend_name(self) -> str:
+        if self.api_key:
+            return "gemini"
+        return "onnx" if semantic_cache_enabled() else "hash"
+
+    def status(self) -> dict:
+        with self._stats_lock:
+            return {
+                "backend": self.backend_name(),
+                "successfulCalls": self._successful_requests,
+                "failedCalls": self._failed_requests,
+                "embeddedDocuments": self._embedded_documents,
+            }
+
+    def _throttle(self) -> None:
+        requests_per_second = max(0.1, float(os.getenv("GEMINI_EMBED_REQUESTS_PER_SECOND", "1")))
+        with self._rate_lock:
+            wait = (1 / requests_per_second) - (time.monotonic() - self._last_request_at)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_at = time.monotonic()
+
+    @staticmethod
+    def _retry_delay(response: Optional[requests.Response], attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        try:
+            if retry_after is not None:
+                return min(15.0, max(0.0, float(retry_after)))
+        except ValueError:
+            pass
+        return min(15.0, (2 ** attempt) + random.uniform(0, 0.5))
+
+    def _embed_gemini_batch(self, model_name: str, texts: List[str]) -> Embeddings:
+        request_data = [{
+            "model": model_name,
+            "content": {"parts": [{"text": text[:2048]}]},
+            "outputDimensionality": 384,
+        } for text in texts]
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:batchEmbedContents?key={self.api_key}"
+        last_error = "unknown error"
+        for attempt in range(4):
+            response = None
+            try:
+                self._throttle()
+                response = requests.post(url, json={"requests": request_data}, timeout=(5, 20))
+                if response.status_code == 200:
+                    embeddings = response.json().get("embeddings", [])
+                    if len(embeddings) != len(texts):
+                        raise EmbeddingBackendUnavailable("Gemini returned an incomplete embedding batch")
+                    vectors = [item["values"] for item in embeddings]
+                    with self._stats_lock:
+                        self._successful_requests += 1
+                        self._embedded_documents += len(vectors)
+                    return vectors
+                if response.status_code == 404:
+                    raise FileNotFoundError(model_name)
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+            except FileNotFoundError:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+
+            delay = self._retry_delay(response, attempt)
+            logger.warning("Gemini embedding batch failed (%s, attempt %s/4); retrying in %.1fs", last_error, attempt + 1, delay)
+            time.sleep(delay)
+
+        with self._stats_lock:
+            self._failed_requests += 1
+        raise EmbeddingBackendUnavailable(f"Gemini embeddings unavailable after retries: {last_error}")
 
     def __call__(self, input: Documents) -> Embeddings:
-        # 1. Try Gemini Cloud Embeddings with 384 dimensions
+        # A collection receives vectors from exactly one backend. Gemini errors
+        # must fail the batch rather than silently inserting hash vectors.
         if self.api_key:
             candidate_models = [self.preferred_model] if self.preferred_model else ["models/gemini-embedding-001", "models/text-embedding-004"]
             for model_name in candidate_models:
                 if not model_name:
                     continue
-                requests_data = [
-                    {
-                        "model": model_name,
-                        "content": {"parts": [{"text": (text or "")[:2048]}]},
-                        "outputDimensionality": 384
-                    }
-                    for text in input
-                ]
-                url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:batchEmbedContents?key={self.api_key}"
-                for attempt in range(2):
-                    resp = None
-                    try:
-                        resp = requests.post(url, json={"requests": requests_data}, timeout=(5, 12))
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            if "embeddings" in data and len(data["embeddings"]) > 0:
-                                self.preferred_model = model_name
-                                return [e["values"] for e in data["embeddings"]]
-                        elif resp.status_code == 404:
-                            break  # Try next candidate model
-                        else:
-                            logger.warning(f"[ChromaDB] Gemini {model_name} attempt {attempt + 1} returned status {resp.status_code}")
-                    except Exception as e:
-                        logger.warning(f"[ChromaDB] Gemini {model_name} attempt {attempt + 1} failed: {e}")
-                    
-                    if attempt == 0:
-                        wait_time = 1.2 if (resp is not None and resp.status_code == 429) else 0.3
-                        time.sleep(wait_time)
+                try:
+                    vectors = []
+                    texts = [(text or "") for text in input]
+                    for offset in range(0, len(texts), 20):
+                        vectors.extend(self._embed_gemini_batch(model_name, texts[offset:offset + 20]))
+                    self.preferred_model = model_name
+                    return vectors
+                except FileNotFoundError:
+                    continue
+            raise EmbeddingBackendUnavailable("No configured Gemini embedding model is available")
 
         # Local ONNX is optional on constrained Render instances.  With semantic
         # caching off, use deterministic hash vectors instead of loading MiniLM.
@@ -77,7 +141,7 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
                     if local_ef is not None and not isinstance(local_ef, ResilientEmbeddingFunction):
                         return local_ef(input)
             except Exception as onnx_err:
-                logger.warning(f"[ChromaDB] Local ONNX fallback failed: {onnx_err}. Using emergency hash vectors.")
+                raise EmbeddingBackendUnavailable(f"Local ONNX embeddings failed: {onnx_err}") from onnx_err
 
         # 3. Emergency Normalized Hash Vector (384 dimensions matching collection dimension)
         results = []
@@ -121,6 +185,10 @@ def get_embedding_function() -> ResilientEmbeddingFunction:
                 _embedding_fn = ResilientEmbeddingFunction()
     return _embedding_fn
 
+
+def get_embedding_status() -> dict:
+    return get_embedding_function().status()
+
 def get_chroma_client():
     global _client
     if _client is not None:
@@ -143,12 +211,19 @@ def check_chroma_connection() -> dict:
 def _get_or_init_collection(name: str, embedding_fn=None):
     c = get_chroma_client()
     ef = embedding_fn or get_embedding_function()
+    expected_backend = ef.backend_name() if isinstance(ef, ResilientEmbeddingFunction) else "custom"
     try:
-        return c.get_or_create_collection(
+        collection = c.get_or_create_collection(
             name=name,
             embedding_function=ef,
-            metadata={"hnsw:space": "cosine"}
+            metadata={"hnsw:space": "cosine", "embeddingBackend": expected_backend}
         )
+        actual_backend = (collection.metadata or {}).get("embeddingBackend")
+        if actual_backend and actual_backend != expected_backend:
+            raise EmbeddingBackendUnavailable(
+                f"Collection '{name}' uses {actual_backend} vectors, but this process is configured for {expected_backend}."
+            )
+        return collection
     except Exception as e:
         if "dimension" in str(e).lower():
             logger.info(f"[ChromaDB] Resetting collection {name} for dimension match...")

@@ -305,6 +305,16 @@ export default function RepoIngestion({ onIngestionComplete, activeRepo, backend
                     Index is incomplete: the {stats.ingestionReport.limits?.maxSourceFiles}-file limit was reached. Results must not be used to conclude a module is absent.
                   </p>
                 )}
+                {stats.ingestionReport.embeddingStatus === 'degraded' && (
+                  <p style={{ color: '#f87171', marginBottom: '8px' }}>
+                    Embedding service was unavailable. This index is degraded; retry indexing before relying on retrieval results.
+                  </p>
+                )}
+                {(stats.ingestionReport.warnings?.length ?? 0) > 0 && (
+                  <p style={{ color: '#fbbf24', marginBottom: '8px' }}>
+                    {stats.ingestionReport.warnings.join(' ')}
+                  </p>
+                )}
                 <details>
                   <summary>Parsed source files ({stats.ingestionReport.parsedFiles?.length ?? stats.ingestionReport.discoveredFiles?.length ?? 0})</summary>
                   <pre style={{ maxHeight: '180px', overflow: 'auto', marginTop: '6px', whiteSpace: 'pre-wrap' }}>{(stats.ingestionReport.parsedFiles || stats.ingestionReport.discoveredFiles || []).join('\n') || 'None'}</pre>

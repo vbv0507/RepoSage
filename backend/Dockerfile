@@ -15,7 +15,8 @@ USER appuser
 ENV HOME=/home/appuser \
     PYTHONUNBUFFERED=1 \
     CHROMA_PATH=/tmp/chroma \
-    SEMANTIC_CACHE=off
+    SEMANTIC_CACHE=off \
+    AUTO_INDEX_SAMPLE_REPO=false
 
 EXPOSE 7860
 
