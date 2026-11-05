@@ -4,7 +4,7 @@ FastAPI backend for a Render free Docker web service.
 
 Set these Render environment variables before deploying:
 
-- `GEMINI_API_KEY` or `OPENAI_API_KEY`
+- `GEMINI_API_KEY` for the primary model and `XAI_API_KEY` for Grok fallback
 - `AGENT_SECRET` for trusted server-to-server `/api/agent` calls
 - `ALLOWED_ORIGINS` with the exact Vercel frontend origin
 - `SEMANTIC_CACHE=off` to avoid loading the local MiniLM model on Render Free

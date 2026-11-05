@@ -34,6 +34,9 @@ RepoSage is an AI-powered legacy codebase intelligence and architecture copilot.
 - Cloud embedding via Google Gemini API with automatic exponential retry.
 - Optional thread-safe local ONNX fallback (`all-MiniLM-L6-v2`) when `SEMANTIC_CACHE=on`; Render Free defaults to deterministic hash-vector fallback to stay within its memory budget.
 
+### 🤖 LLM Failover
+- Gemini is the default LLM. When `XAI_API_KEY` is configured, failed Gemini requests automatically retry through xAI Grok.
+
 ### 🌊 Real-Time SSE Token Streaming
 - Chat answers stream in real-time token-by-token over Server-Sent Events (`/api/chat-stream`), accompanied by early metadata emissions for referenced code lines and Git archaeology commits.
 
