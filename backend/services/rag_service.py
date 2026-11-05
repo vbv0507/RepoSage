@@ -335,7 +335,9 @@ async def _ingest_codebase_unlocked(
                 non_empty_lines = sum(1 for line in source if line.strip())
         except OSError:
             non_empty_lines = 5
-        if non_empty_lines < 5:
+        # Small implementation files are valid source. Only discard the common
+        # empty-package boilerplate that adds no retrieval value.
+        if os.path.basename(file_path) == "__init__.py" and non_empty_lines < 5:
             ingestion_report["skippedFiles"].append({
                 "path": os.path.relpath(file_path, repo_path).replace("\\", "/"),
                 "reason": "near_empty_source",
