@@ -1,7 +1,7 @@
 import React from 'react';
 
 export default function Header({ health, activeRepo }) {
-  const redisConnected = health?.services?.redis?.connected;
+  const cacheConnected = health?.services?.cache?.connected;
   const chromaConnected = health?.services?.chroma?.connected;
   const llmConfigured = health?.services?.llm?.configured;
 
@@ -42,10 +42,10 @@ export default function Header({ health, activeRepo }) {
           <span style={{ whiteSpace: 'nowrap' }}>{chromaConnected ? 'ChromaDB' : 'Chroma'}</span>
         </div>
 
-        {/* Redis Status */}
+        {/* In-memory Cache Status */}
         <div className="header-status-item" style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-          <span className={`status-dot ${redisConnected ? 'online' : 'warning'}`} />
-          <span style={{ whiteSpace: 'nowrap' }}>{redisConnected ? 'Redis' : 'Cache'}</span>
+          <span className={`status-dot ${cacheConnected ? 'online' : 'warning'}`} />
+          <span style={{ whiteSpace: 'nowrap' }}>Cache</span>
         </div>
 
         {/* LLM Status */}

@@ -2,7 +2,7 @@
 agent_routes.py � Spider AI Agent API for RepoSage
 
 Exposes authenticated, LLM-friendly JSON endpoints that Spider AI (portfolio chatbot)
-can call to query codebases, check ChromaDB/Redis status, and trigger AST indexing.
+can call to query codebases, check ChromaDB/cache status, and trigger AST indexing.
 
 Auth: Requires 'x-agent-token' header matching AGENT_SECRET env var.
 Mounted at: /api/agent (in main.py)
@@ -17,6 +17,7 @@ from fastapi import APIRouter, Header, HTTPException, status, Depends, Query
 from pydantic import BaseModel
 
 logger = logging.getLogger("reposage_agent")
+CLONED_REPO_ROOT = os.getenv("CLONED_REPO_ROOT", "/tmp/reposage_clones")
 
 router = APIRouter(tags=["Agent Control Plane"])
 
@@ -48,7 +49,7 @@ class AgentIngestRequest(BaseModel):
 # --- Helper to list available repos ---
 def list_available_repos() -> List[Dict[str, Any]]:
     repos = []
-    clone_base = os.path.abspath("./cloned_repos")
+    clone_base = os.path.abspath(CLONED_REPO_ROOT)
     if os.path.exists(clone_base):
         for entry in os.listdir(clone_base):
             full = os.path.join(clone_base, entry)
@@ -65,12 +66,12 @@ def list_available_repos() -> List[Dict[str, Any]]:
 @router.get("/ping", dependencies=[Depends(verify_agent_token)])
 async def agent_ping():
     """Connectivity & readiness probe for Spider AI."""
-    from services.redis_service import cache_service
+    from services.cache_service import cache_service
     from services.chroma_service import check_chroma_connection
     from services.llm_provider import check_config_status
 
     chroma = await asyncio.to_thread(check_chroma_connection)
-    redis_status = cache_service.get_status()
+    cache_status = cache_service.get_status()
     llm = check_config_status()
 
     return {
@@ -79,7 +80,7 @@ async def agent_ping():
         "status": "online",
         "engine": "FastAPI + Tree-sitter + Dual-Collection ChromaDB",
         "services": {
-            "redis": redis_status,
+            "cache": cache_status,
             "chroma": chroma,
             "llm": llm
         }
@@ -94,7 +95,7 @@ async def agent_status():
         get_queries_collection,
         check_chroma_connection
     )
-    from services.redis_service import cache_service
+    from services.cache_service import cache_service
     from services.llm_provider import check_config_status
 
     def get_counts():
@@ -194,7 +195,7 @@ async def agent_ingest(req: AgentIngestRequest):
 async def agent_graph(path: str = Query(..., description="Repository path")):
     """Fetch module dependency graph from cache."""
     from services.rag_service import resolve_repo_path
-    from services.redis_service import cache_service
+    from services.cache_service import cache_service
 
     try:
         resolved = resolve_repo_path(path)

@@ -1,0 +1,8 @@
+.env
+.venv
+__pycache__
+*.pyc
+chroma_data
+cloned_repos
+node_modules
+tests

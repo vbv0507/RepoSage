@@ -42,7 +42,7 @@ export default function App() {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     try {
-      // 20s per-request timeout: gives Azure scale-to-zero cold-starts (12-18s) enough time to wake up
+      // Allow a sleeping free backend enough time to wake before retrying.
       // without prematurely aborting and staying stuck in disabled state.
       const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(20000) });
       if (res.ok) {

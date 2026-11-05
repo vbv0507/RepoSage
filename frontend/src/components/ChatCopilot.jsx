@@ -19,7 +19,7 @@ export default function ChatCopilot({ activeRepo }) {
   const suggestedPrompts = [
     "Where do I add a new API endpoint?",
     "Explain the end-to-end data flow of this codebase.",
-    "Why does this project use both ChromaDB and Redis together?",
+    "How does RepoSage cache similar questions?",
     "What modules will be affected if we modify astParser.js?",
     "Show me architectural decisions revealed by Git Archaeology."
   ];
@@ -447,7 +447,7 @@ export default function ChatCopilot({ activeRepo }) {
                         borderRadius: '12px',
                         fontWeight: '500'
                       }}>
-                        ⚡ Exact Cache Hit (Redis)
+                        ⚡ Exact Cache Hit
                       </span>
                     )
                   )}

@@ -1,4 +1,4 @@
-name: Build & Push Containers
+name: Validate RepoSage
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  validate:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -16,59 +16,24 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set Lowercase Repository Owner
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test backend
+        working-directory: backend
         run: |
-          echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> ${GITHUB_ENV}
+          pip install -r requirements.txt
+          python -m unittest discover -s tests -v
 
-      - name: Log in to GitHub Container Registry (GHCR)
-        uses: docker/login-action@v3
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          node-version: "22"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and Push Backend Image to GHCR
-        uses: docker/build-push-action@v5
-        with:
-          context: ./backend
-          push: true
-          tags: |
-            ghcr.io/${{ env.REPO_OWNER }}/reposage-backend:latest
-            ghcr.io/${{ env.REPO_OWNER }}/reposage-backend:${{ github.sha }}
-
-      - name: Build and Push Frontend Image to GHCR
-        uses: docker/build-push-action@v5
-        with:
-          context: ./frontend
-          push: true
-          tags: |
-            ghcr.io/${{ env.REPO_OWNER }}/reposage-frontend:latest
-            ghcr.io/${{ env.REPO_OWNER }}/reposage-frontend:${{ github.sha }}
-
-      - name: Log in to Azure
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Auto-Deploy to Azure Container Apps
+      - name: Build frontend
+        working-directory: frontend
         run: |
-          az extension add --name containerapp --upgrade --yes
-          
-          echo "🚀 Deploying Backend to Azure Container Apps (SHA: ${{ github.sha }})..."
-          az containerapp update \
-            --name reposage-backend \
-            --resource-group reposage-rg \
-            --image ghcr.io/${{ env.REPO_OWNER }}/reposage-backend:${{ github.sha }} \
-            --revision-suffix "run-${{ github.run_number }}"
-          
-          echo "🚀 Deploying Frontend to Azure Container Apps (SHA: ${{ github.sha }})..."
-          az containerapp update \
-            --name reposage-frontend \
-            --resource-group reposage-rg \
-            --image ghcr.io/${{ env.REPO_OWNER }}/reposage-frontend:${{ github.sha }} \
-            --revision-suffix "run-${{ github.run_number }}"
-          
-          echo "✅ Both containers successfully deployed with new active revisions to Azure!"
+          npm install
+          npm run build

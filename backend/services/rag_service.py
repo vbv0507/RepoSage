@@ -16,7 +16,7 @@ from .chroma_service import (
     store_code_chunks, store_diff_summaries, store_file_profiles, find_relevant_files, search_codebase, get_repo_vector_stats,
     store_query_cache, find_semantic_query_match, clear_query_cache, delete_repo_file_vectors
 )
-from .redis_service import cache_service
+from .cache_service import cache_service
 from .llm_provider import get_chat_model
 
 
@@ -24,6 +24,7 @@ logger = logging.getLogger("rag_service")
 
 WINDOWS_PATH = re.compile(r"^[a-zA-Z]:[\\\\/]")
 UPLOAD_REPO_PREFIX = "upload://"
+CLONED_REPO_ROOT = os.getenv("CLONED_REPO_ROOT", "/tmp/reposage_clones")
 SEMANTIC_CACHE_DIRECT_THRESHOLD = 0.88
 SEMANTIC_CACHE_OFFLINE_THRESHOLD = 0.80
 CONFIDENCE_HIGH_SIMILARITY_THRESHOLD = 0.80
@@ -173,7 +174,11 @@ def validate_remote_git_url(url: str) -> None:
             raise ValueError(f"Invalid IP address resolved for repository: {err}")
 
 
-def resolve_repo_path(input_path: str, on_progress: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
+def resolve_repo_path(
+    input_path: str,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    clone_depth: int = 30,
+) -> str:
     if not input_path:
         raise ValueError("Repository path or URL is required.")
     trimmed = input_path.strip()
@@ -193,14 +198,14 @@ def resolve_repo_path(input_path: str, on_progress: Optional[Callable[[Dict[str,
     validate_remote_git_url(trimmed)
 
     repo_name = trimmed.rstrip('/').split('/')[-1].replace('.git', '') or 'remote_repo'
-    clone_base = os.path.abspath('./cloned_repos')
+    clone_base = os.path.abspath(CLONED_REPO_ROOT)
     os.makedirs(clone_base, exist_ok=True)
     target_dir = os.path.join(clone_base, repo_name)
 
     if not os.path.exists(target_dir):
         if on_progress:
             on_progress({"step": "cloning", "message": f"Cloning remote GitHub repository: {trimmed}..."})
-        Repo.clone_from(trimmed, target_dir, depth=30)
+        Repo.clone_from(trimmed, target_dir, depth=clone_depth)
         if on_progress:
             on_progress({"step": "cloned", "message": f"Successfully cloned {repo_name}."})
     else:
@@ -272,14 +277,15 @@ def _asks_for_signature(question: str) -> bool:
 async def ingest_codebase(
     repo_path: str,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
-    force_refresh: bool = False
+    force_refresh: bool = False,
+    max_source_files: Optional[int] = None,
 ) -> Dict[str, Any]:
     def notify(data):
         if on_progress:
             on_progress(data)
 
     notify({"step": "scanning", "message": "Scanning directory tree and detecting programming languages..."})
-    file_paths, ingestion_report = scan_directory_with_report(repo_path)
+    file_paths, ingestion_report = scan_directory_with_report(repo_path, max_files=max_source_files or 2000)
     if not file_paths:
         raise ValueError(f"No parseable source code files discovered in: {repo_path}")
 
@@ -465,7 +471,7 @@ def _build_coverage_context(report: Optional[Dict[str, Any]]) -> str:
     )
 
 def _build_cache_key(repo_path: Optional[str], index_id: Optional[str], question: str) -> str:
-    """Build canonical Redis exact-cache key versioned with content fingerprint."""
+    """Build canonical exact-cache key versioned with content fingerprint."""
     clean_q = (question or "").strip().lower()
     return f"query:v3:{repo_path}:{index_id}:{clean_q}"
 
@@ -658,11 +664,11 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     if not refresh:
         cached = await cache_service.get(cache_key)
         if cached and cached.get("answer"):
-            logger.info(f"[Cache] ⚡ Returning exact match from Redis for: '{question}'")
+            logger.info(f"[Cache] Returning exact in-memory match for: '{question}'")
             return {
                 **cached,
                 "fromCache": True,
-                "cacheType": "exact_redis",
+                "cacheType": "exact_memory",
                 "confidenceLevel": cached.get("confidenceLevel", "high")
             }
 
@@ -968,7 +974,7 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         "citations": list(set(citations))
     }
 
-    # Cache in Redis (Fast Exact Tier)
+    # Cache in memory (fast exact tier)
     await cache_service.set(cache_key, result, 86400)
 
     # Cache in ChromaDB reposage_queries (Local Semantic Vector Tier)
@@ -996,12 +1002,12 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
     if not refresh:
         cached = await cache_service.get(cache_key)
         if cached and cached.get("answer"):
-            logger.info(f"[Cache] ⚡ Returning exact match from Redis for streaming: '{question}'")
+            logger.info(f"[Cache] Returning exact in-memory match for streaming: '{question}'")
             yield {
                 "type": "meta",
                 "responseType": cached.get("type", "chat"),
                 "fromCache": True,
-                "cacheType": "exact_redis",
+                "cacheType": "exact_memory",
                 "confidenceLevel": cached.get("confidenceLevel", "high"),
                 "basedOn": cached.get("basedOn", []),
                 "steps": cached.get("steps", []),
@@ -1015,7 +1021,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
                 "type": "done",
                 **cached,
                 "fromCache": True,
-                "cacheType": "exact_redis",
+                "cacheType": "exact_memory",
                 "confidenceLevel": cached.get("confidenceLevel", "high")
             }
             return
@@ -1388,7 +1394,7 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
         "citations": list(set(citations))
     }
 
-    # Cache in Redis (Fast Exact Tier)
+    # Cache in memory (fast exact tier)
     await cache_service.set(cache_key, result, 86400)
 
     # Cache in ChromaDB reposage_queries (Local Semantic Vector Tier)

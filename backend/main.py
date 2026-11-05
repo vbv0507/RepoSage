@@ -19,7 +19,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("reposage_backend")
 
-from services.redis_service import cache_service
+from services.cache_service import cache_service
 from services.chroma_service import check_chroma_connection
 from services.llm_provider import check_config_status
 from services.ast_parser import CODE_EXTENSIONS, IGNORED_DIRS, is_ignored_file
@@ -31,22 +31,16 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Configure CORS: allow_credentials=False avoids spec violations with wildcard/permissive origins
-raw_allowed_origins = os.getenv("ALLOWED_ORIGINS", "")
-if raw_allowed_origins.strip():
-    allowed_origins = [origin.strip() for origin in raw_allowed_origins.split(",") if origin.strip()]
-else:
-    allowed_origins = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173"
-    ]
+# Configure CORS from a comma-separated environment variable.
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    if origin.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"^https:\/\/reposage-frontend\..*",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,9 +61,8 @@ class ChatRequest(BaseModel):
     question: str
     refresh: Optional[bool] = False
 
-# 30 days retention TTL in Redis.
-# LIMITATION NOTE: Redis acts as an ephemeral caching tier; conversation history is not indefinitely persistent.
-CONVERSATION_TTL_SECONDS = 30 * 86400
+# In-memory cache lifetime. Free hosted instances reset their cache on restart.
+CONVERSATION_TTL_SECONDS = 3600
 
 class CreateConversationRequest(BaseModel):
     repoPath: Optional[str] = None
@@ -99,6 +92,8 @@ class MessagePayload(BaseModel):
 
 MAX_UPLOAD_FILES = 2000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+SAMPLE_REPOSITORY_URL = os.getenv("SAMPLE_REPOSITORY_URL", "https://github.com/vbv0507/RepoSage")
+SAMPLE_REPOSITORY_MAX_FILES = int(os.getenv("SAMPLE_REPOSITORY_MAX_FILES", "100"))
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
@@ -148,18 +143,45 @@ async def _chat_stream_response(repo_path: Optional[str], question: str, refresh
 @app.get("/api/health")
 async def health_check():
     chroma = await asyncio.to_thread(check_chroma_connection)
-    redis_status = cache_service.get_status()
+    cache_status = cache_service.get_status()
     llm = check_config_status()
 
     return {
         "status": "ok",
         "engine": "Python (FastAPI + LangChain)",
         "services": {
-            "redis": redis_status,
+            "cache": cache_status,
             "chroma": chroma,
             "llm": llm
         }
     }
+
+
+@app.get("/health")
+async def simple_health_check():
+    """Lightweight Hugging Face Space health probe."""
+    return {"status": "ok"}
+
+
+async def index_sample_repository_if_needed():
+    """Warm an empty Chroma database without delaying health checks."""
+    if os.getenv("AUTO_INDEX_SAMPLE_REPO", "true").lower() not in {"1", "true", "yes"}:
+        return
+    try:
+        from services.chroma_service import get_code_collection
+
+        if get_code_collection().count() > 0:
+            return
+        logger.info("Indexing the configured sample repository in the background.")
+        repo_path = await asyncio.to_thread(resolve_repo_path, SAMPLE_REPOSITORY_URL, clone_depth=1)
+        await ingest_codebase(repo_path, max_source_files=SAMPLE_REPOSITORY_MAX_FILES)
+    except Exception as exc:
+        logger.warning("Sample repository indexing skipped: %s", exc)
+
+
+@app.on_event("startup")
+async def start_sample_indexing():
+    asyncio.create_task(index_sample_repository_if_needed())
 
 
 @app.post("/api/upload-repository")
@@ -266,7 +288,7 @@ async def ingest_stream(
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=10)
             except asyncio.TimeoutError:
-                # Prevent Azure/NGINX idle connection timeouts during a long
+                # Keep long-running indexing streams active through proxies.
                 # vector batch. SSE comments are ignored by the UI.
                 yield ": keep-alive\n\n"
                 continue
@@ -338,8 +360,7 @@ def _validate_conversation_id(conversation_id: str) -> str:
 async def create_conversation(req: CreateConversationRequest):
     """Create a new conversation session tied to a repoPath.
 
-    Conversation data is cached in Redis under 'conversation:{id}' with a 30-day TTL.
-    NOTE: Redis provides ephemeral thread persistence, not indefinite archival storage.
+    Conversation data is kept in the in-process TTL cache.
     """
     conversation_id = str(uuid.uuid4())
     conv_data = {
@@ -419,6 +440,6 @@ async def graph_endpoint(path: str = Query(..., description="Repository path or 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", "7860"))
     logger.info(f"🚀 Starting RepoSage Python FastAPI Backend on http://localhost:{port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

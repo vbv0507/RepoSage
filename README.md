@@ -21,13 +21,13 @@ RepoSage is an AI-powered legacy codebase intelligence and architecture copilot.
 ### 💬 Persistent, Shareable Conversation History
 - **Stateful Threads**: Conversations survive page refreshes and can be shared across team members via URL query parameters (`?conversation={id}`).
 - **One-Click Link Sharing**: Built-in "Copy share link" button in the chat header with clipboard feedback.
-- **Fast Redis Persistence**: Thread messages, citations, and confidence metadata are persisted in Redis with a 30-day retention TTL (`conversation:{id}`).
+- **Session Conversation History**: Thread messages, citations, and confidence metadata are retained in a bounded in-memory cache for the active service session.
 - **Defensive UUID Validation**: Endpoints validate that conversation identifiers are well-formed UUIDs, preventing injection into cache keys.
 
 ### ⚡ Incremental Indexing & Caching
 - **Per-File Hash Delta Detection**: Automatically tracks SHA-256 hashes of indexed files. On re-indexing, only added, modified, or deleted files are parsed and embedded, avoiding full vector store wipes.
 - **Multi-Tier Semantic Cache**:
-  - **Tier 1 (Exact Match)**: Sub-millisecond exact query retrieval via Redis.
+  - **Tier 1 (Exact Match)**: Fast in-memory exact query retrieval.
   - **Tier 2 (ChromaDB Vector Cache)**: Semantic vector cache using cosine similarity ($\ge 88\%$ threshold for direct matches, $\ge 80\%$ threshold for offline fallback).
 
 ### 🛡️ Multi-Tier Resilient Embeddings
@@ -41,20 +41,24 @@ RepoSage is an AI-powered legacy codebase intelligence and architecture copilot.
 
 ## Getting Started
 
-### Run with Docker Compose
+### Live Demo
 
-1. Copy `.env.example` to `.env` and configure your API key:
-   ```env
-   LLM_PROVIDER=gemini
-   GEMINI_API_KEY=your_gemini_api_key_here
-   ```
-2. Start the stack:
-   ```bash
-   docker compose up --build
-   ```
-3. Open `http://localhost:3000` in your browser.
+- Frontend: `https://YOUR-VERCEL-PROJECT.vercel.app`
+- API: `https://YOUR-HUGGING-FACE-SPACE.hf.space`
 
-The backend (FastAPI), frontend (Vite/React), ChromaDB, and Redis will start automatically.
+```mermaid
+flowchart LR
+  V[Vercel: React + Vite] -->|HTTPS / API| H[Hugging Face Space: FastAPI]
+  H --> C[Local ChromaDB: /tmp/chroma]
+  H --> G[Gemini embeddings and LLM]
+```
+
+### Known limitations on the free tier
+
+- Hugging Face Spaces can cold-start after inactivity.
+- `/tmp/chroma`, cloned repositories, uploaded folders, cache entries, and conversation history are ephemeral; they reset when the Space restarts.
+- A small public sample repository is indexed in the background after an empty-space restart, so the demo may take a short time before its first results are ready.
+- Browser uploads and large repository indexing are limited by free CPU, memory, and request duration.
 
 ---
 
@@ -66,7 +70,7 @@ cd backend
 python -m venv .venv
 .\.venv\Scripts\activate      # Windows (or source .venv/bin/activate on Unix)
 pip install -r requirements.txt
-uvicorn main:app --reload --port 5000
+uvicorn main:app --reload --port 7860
 ```
 
 #### 2. Frontend Setup
@@ -76,6 +80,9 @@ npm install
 npm run dev
 ```
 Open `http://localhost:5173` to access the development UI.
+
+Set `VITE_API_URL=http://localhost:7860` in `frontend/.env.local` when running
+the frontend outside the Vite proxy. Do not commit `.env.local`.
 
 ---
 

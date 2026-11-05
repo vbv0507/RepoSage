@@ -16,7 +16,7 @@ import socket
 
 logger = logging.getLogger("chroma_service")
 
-CHROMA_URL = os.getenv("CHROMA_URL", "").strip()
+CHROMA_PATH = os.getenv("CHROMA_PATH", "/tmp/chroma")
 
 class ResilientEmbeddingFunction(EmbeddingFunction):
     """
@@ -123,23 +123,8 @@ def get_chroma_client():
     if _client is not None:
         return _client
 
-    # Try connecting to remote/local HTTP server only if CHROMA_URL is explicitly configured and not an unreachable Docker-compose hostname
-    if CHROMA_URL and CHROMA_URL.lower() not in ("none", "false", "local", "disabled", "http://chroma:8000") and not CHROMA_URL.startswith("http://chroma") and CHROMA_URL.startswith("http"):
-        try:
-            # Fast HTTP heartbeat check with 1.5s timeout to prevent thread freezes
-            hb_resp = requests.get(f"{CHROMA_URL.rstrip('/')}/api/v1/heartbeat", timeout=1.5)
-            if hb_resp.status_code == 200:
-                parts = CHROMA_URL.replace("http://", "").replace("https://", "").split(":")
-                host = parts[0]
-                port = int(parts[1]) if len(parts) > 1 else 8000
-                client = chromadb.HttpClient(host=host, port=port)
-                _client = client
-                return _client
-        except Exception as e:
-            logger.info(f"[ChromaDB] HTTP ChromaDB not reachable at {CHROMA_URL}: {e}. Initializing persistent local DB.")
-
-    # Fallback to local persistent storage immediately
-    persist_dir = os.path.abspath("./chroma_data")
+    # Hugging Face Spaces use this local, ephemeral path by design.
+    persist_dir = os.path.abspath(CHROMA_PATH)
     os.makedirs(persist_dir, exist_ok=True)
     _client = chromadb.PersistentClient(path=persist_dir)
     return _client

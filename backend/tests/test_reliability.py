@@ -442,7 +442,7 @@ class ReliabilityTests(unittest.TestCase):
             asyncio.run(rag_service.cache_service.delete(cache_k1))
             asyncio.run(rag_service.cache_service.set(f"ingestion_report:{repo_dir}", report_v1))
 
-            # Step 1: Call non-streaming query_codebase - populates the exact Redis cache
+            # Step 1: Call non-streaming query_codebase - populates the exact cache
             res1 = asyncio.run(rag_service.query_codebase(repo_dir, question))
             self.assertEqual(res1["answer"], "Grounded answer")
             self.assertFalse(res1.get("fromCache", False))
@@ -464,7 +464,7 @@ class ReliabilityTests(unittest.TestCase):
             self.assertIsNotNone(meta_event, "Streaming should yield meta event")
             self.assertIsNotNone(done_event, "Streaming should yield done event")
             self.assertTrue(meta_event.get("fromCache"), "Streaming must return fromCache=True on shared cache hit")
-            self.assertEqual(meta_event.get("cacheType"), "exact_redis")
+            self.assertEqual(meta_event.get("cacheType"), "exact_memory")
             self.assertEqual(done_event.get("answer"), "Grounded answer")
             # LLM was NOT invoked again!
             self.assertEqual(mock_llm.ainvoke.call_count, 1)
@@ -582,7 +582,7 @@ class ReliabilityTests(unittest.TestCase):
                     self.assertIsNotNone(meta_evt)
                     self.assertIsNotNone(done_evt)
                     self.assertTrue(meta_evt.get("fromCache"))
-                    self.assertEqual(meta_evt.get("cacheType"), "exact_redis")
+                    self.assertEqual(meta_evt.get("cacheType"), "exact_memory")
                     self.assertIn("calculate_tax", done_evt["answer"])
                     # Confirmed: no second LLM call!
                     self.assertEqual(chat_model.ainvoke_calls, 1)
@@ -798,9 +798,9 @@ class ReliabilityTests(unittest.TestCase):
         # 4. Append assistant message with confidenceLevel and citations
         assistant_msg = {
             "role": "assistant",
-            "text": "The cache system uses Redis with a ChromaDB semantic fallback.",
+            "text": "The cache system uses in-memory storage with a ChromaDB semantic fallback.",
             "confidenceLevel": "high",
-            "codeCitations": [{"filePath": "services/redis_service.py", "startLine": 1, "endLine": 50}],
+            "codeCitations": [{"filePath": "services/cache_service.py", "startLine": 1, "endLine": 50}],
             "fromCache": False
         }
         append_asst_resp = client.post(f"/api/conversations/{conv_id}/messages", json=assistant_msg)
@@ -818,7 +818,7 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(history["messages"][0]["text"], "How does the cache system work?")
         self.assertEqual(history["messages"][1]["role"], "assistant")
         self.assertEqual(history["messages"][1]["confidenceLevel"], "high")
-        self.assertEqual(history["messages"][1]["codeCitations"][0]["filePath"], "services/redis_service.py")
+        self.assertEqual(history["messages"][1]["codeCitations"][0]["filePath"], "services/cache_service.py")
 
         # 6. Non-existent valid UUID returns 404
         unused_uuid = str(uuid.uuid4())
