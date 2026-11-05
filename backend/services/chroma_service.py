@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional
 import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 import chromadb.utils.embedding_functions as chromadb_ef
+from .runtime_config import semantic_cache_enabled
 
 import socket
 
@@ -66,15 +67,17 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
                         wait_time = 1.2 if (resp is not None and resp.status_code == 429) else 0.3
                         time.sleep(wait_time)
 
-        # 2. Resilient Local ONNX Embedding Fallback (all-MiniLM-L6-v2) - Thread-locked to avoid CPU/OOM spikes
-        try:
-            with self._onnx_lock:
-                logger.warning("[ChromaDB] Gemini embedding unavailable. Falling back to local ONNX embeddings (all-MiniLM-L6-v2).")
-                local_ef = get_local_query_embedding_function()
-                if local_ef is not None and not isinstance(local_ef, ResilientEmbeddingFunction):
-                    return local_ef(input)
-        except Exception as onnx_err:
-            logger.warning(f"[ChromaDB] Local ONNX fallback failed: {onnx_err}. Using emergency hash vectors.")
+        # Local ONNX is optional on constrained Render instances.  With semantic
+        # caching off, use deterministic hash vectors instead of loading MiniLM.
+        if semantic_cache_enabled():
+            try:
+                with self._onnx_lock:
+                    logger.warning("[ChromaDB] Gemini embedding unavailable. Falling back to local ONNX embeddings (all-MiniLM-L6-v2).")
+                    local_ef = get_local_query_embedding_function()
+                    if local_ef is not None and not isinstance(local_ef, ResilientEmbeddingFunction):
+                        return local_ef(input)
+            except Exception as onnx_err:
+                logger.warning(f"[ChromaDB] Local ONNX fallback failed: {onnx_err}. Using emergency hash vectors.")
 
         # 3. Emergency Normalized Hash Vector (384 dimensions matching collection dimension)
         results = []
@@ -123,7 +126,7 @@ def get_chroma_client():
     if _client is not None:
         return _client
 
-    # Hugging Face Spaces use this local, ephemeral path by design.
+    # Render Free uses this local, ephemeral path by design.
     persist_dir = os.path.abspath(CHROMA_PATH)
     os.makedirs(persist_dir, exist_ok=True)
     _client = chromadb.PersistentClient(path=persist_dir)

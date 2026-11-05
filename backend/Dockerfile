@@ -14,11 +14,9 @@ COPY --chown=appuser:appuser . .
 USER appuser
 ENV HOME=/home/appuser \
     PYTHONUNBUFFERED=1 \
-    CHROMA_PATH=/tmp/chroma
-
-# Download the local all-MiniLM-L6-v2 model while building the image.
-RUN python -c "from chromadb.utils.embedding_functions import DefaultEmbeddingFunction; DefaultEmbeddingFunction()(['warmup'])"
+    CHROMA_PATH=/tmp/chroma \
+    SEMANTIC_CACHE=off
 
 EXPOSE 7860
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 7860 --timeout-keep-alive 300"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860} --timeout-keep-alive 300"]

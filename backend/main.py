@@ -20,10 +20,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("reposage_backend")
 
 from services.cache_service import cache_service
-from services.chroma_service import check_chroma_connection
-from services.llm_provider import check_config_status
-from services.ast_parser import CODE_EXTENSIONS, IGNORED_DIRS, is_ignored_file
-from services.rag_service import UPLOAD_REPO_PREFIX, resolve_repo_path, ingest_codebase, query_codebase, stream_query_codebase
+
+# Do not import Chroma, LangChain, or the ONNX stack while the process is
+# booting. Render uses /health for keep-alives and it must remain lightweight.
+UPLOAD_REPO_PREFIX = "upload://"
+
+
+def _rag_service():
+    from services import rag_service
+    return rag_service
+
+
+def resolve_repo_path(*args, **kwargs):
+    return _rag_service().resolve_repo_path(*args, **kwargs)
+
+
+async def ingest_codebase(*args, **kwargs):
+    return await _rag_service().ingest_codebase(*args, **kwargs)
+
+
+async def query_codebase(*args, **kwargs):
+    return await _rag_service().query_codebase(*args, **kwargs)
+
+
+async def stream_query_codebase(*args, **kwargs):
+    async for event in _rag_service().stream_query_codebase(*args, **kwargs):
+        yield event
 
 app = FastAPI(
     title="RepoSage AI Engine",
@@ -93,7 +115,7 @@ class MessagePayload(BaseModel):
 MAX_UPLOAD_FILES = 2000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 SAMPLE_REPOSITORY_URL = os.getenv("SAMPLE_REPOSITORY_URL", "https://github.com/vbv0507/RepoSage")
-SAMPLE_REPOSITORY_MAX_FILES = int(os.getenv("SAMPLE_REPOSITORY_MAX_FILES", "100"))
+SAMPLE_REPOSITORY_MAX_FILES = int(os.getenv("SAMPLE_REPOSITORY_MAX_FILES", "25"))
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
@@ -103,6 +125,8 @@ SSE_HEADERS = {
 
 def _safe_uploaded_file_path(filename: str) -> Optional[PurePosixPath]:
     """Accept only safe, parseable source files from a browser folder upload."""
+    from services.ast_parser import CODE_EXTENSIONS, IGNORED_DIRS, is_ignored_file
+
     if not filename:
         return None
     candidate = PurePosixPath(filename.replace("\\", "/"))
@@ -142,6 +166,9 @@ async def _chat_stream_response(repo_path: Optional[str], question: str, refresh
 
 @app.get("/api/health")
 async def health_check():
+    from services.chroma_service import check_chroma_connection
+    from services.llm_provider import check_config_status
+
     chroma = await asyncio.to_thread(check_chroma_connection)
     cache_status = cache_service.get_status()
     llm = check_config_status()
@@ -159,7 +186,7 @@ async def health_check():
 
 @app.get("/health")
 async def simple_health_check():
-    """Lightweight Hugging Face Space health probe."""
+    """Lightweight Render health probe; it never initializes Chroma or an LLM."""
     return {"status": "ok"}
 
 

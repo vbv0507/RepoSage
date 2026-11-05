@@ -26,13 +26,13 @@ RepoSage is an AI-powered legacy codebase intelligence and architecture copilot.
 
 ### ⚡ Incremental Indexing & Caching
 - **Per-File Hash Delta Detection**: Automatically tracks SHA-256 hashes of indexed files. On re-indexing, only added, modified, or deleted files are parsed and embedded, avoiding full vector store wipes.
-- **Multi-Tier Semantic Cache**:
+- **Configurable Cache Tiers**:
   - **Tier 1 (Exact Match)**: Fast in-memory exact query retrieval.
-  - **Tier 2 (ChromaDB Vector Cache)**: Semantic vector cache using cosine similarity ($\ge 88\%$ threshold for direct matches, $\ge 80\%$ threshold for offline fallback).
+  - **Tier 2 (optional)**: ChromaDB semantic answer cache using cosine similarity ($\ge 88\%$ threshold for direct matches, $\ge 80\%$ threshold for offline fallback). It is disabled on Render Free via `SEMANTIC_CACHE=off`.
 
-### 🛡️ Multi-Tier Resilient Embeddings
+### 🛡️ Resilient Embeddings
 - Cloud embedding via Google Gemini API with automatic exponential retry.
-- Thread-safe singleton local ONNX fallback (`all-MiniLM-L6-v2`) if cloud APIs are offline or unreachable, ensuring zero downtime and fully offline-capable vector search.
+- Optional thread-safe local ONNX fallback (`all-MiniLM-L6-v2`) when `SEMANTIC_CACHE=on`; Render Free defaults to deterministic hash-vector fallback to stay within its memory budget.
 
 ### 🌊 Real-Time SSE Token Streaming
 - Chat answers stream in real-time token-by-token over Server-Sent Events (`/api/chat-stream`), accompanied by early metadata emissions for referenced code lines and Git archaeology commits.
@@ -44,18 +44,18 @@ RepoSage is an AI-powered legacy codebase intelligence and architecture copilot.
 ### Live Demo
 
 - Frontend: `https://YOUR-VERCEL-PROJECT.vercel.app`
-- API: `https://YOUR-HUGGING-FACE-SPACE.hf.space`
+- API: `https://YOUR-RENDER-SERVICE.onrender.com`
 
 ```mermaid
 flowchart LR
-  V[Vercel: React + Vite] -->|HTTPS / API| H[Hugging Face Space: FastAPI]
+  V[Vercel: React + Vite] -->|HTTPS / API| H[Render Free: FastAPI]
   H --> C[Local ChromaDB: /tmp/chroma]
   H --> G[Gemini embeddings and LLM]
 ```
 
 ### Known limitations on the free tier
 
-- Hugging Face Spaces can cold-start after inactivity.
+- Render Free services sleep after inactivity and cold-start on the next request.
 - `/tmp/chroma`, cloned repositories, uploaded folders, cache entries, and conversation history are ephemeral; they reset when the Space restarts.
 - A small public sample repository is indexed in the background after an empty-space restart, so the demo may take a short time before its first results are ready.
 - Browser uploads and large repository indexing are limited by free CPU, memory, and request duration.

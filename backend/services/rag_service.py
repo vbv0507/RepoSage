@@ -18,6 +18,7 @@ from .chroma_service import (
 )
 from .cache_service import cache_service
 from .llm_provider import get_chat_model
+from .runtime_config import semantic_cache_enabled
 
 
 logger = logging.getLogger("rag_service")
@@ -28,6 +29,19 @@ CLONED_REPO_ROOT = os.getenv("CLONED_REPO_ROOT", "/tmp/reposage_clones")
 SEMANTIC_CACHE_DIRECT_THRESHOLD = 0.88
 SEMANTIC_CACHE_OFFLINE_THRESHOLD = 0.80
 CONFIDENCE_HIGH_SIMILARITY_THRESHOLD = 0.80
+
+
+# Keep semantic-answer caching fully inactive on the Render free plan. Code
+# retrieval remains available through the normal Chroma code collections.
+if not semantic_cache_enabled():
+    async def find_semantic_query_match(*args, **kwargs):
+        return None
+
+    async def store_query_cache(*args, **kwargs):
+        return None
+
+    async def clear_query_cache(*args, **kwargs):
+        return None
 
 
 def compute_confidence_level(
