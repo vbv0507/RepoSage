@@ -86,6 +86,22 @@ class ReliabilityTests(unittest.TestCase):
         self.assertIn("src/retrieval/", context)
         self.assertIn("retriever.py", context)
 
+    def test_multiple_named_files_are_routed_to_focused_retrieval(self):
+        report = {
+            "parsedFiles": [
+                "src/rag_pipeline/retrieval/reranker.py",
+                "configs/retrieval.yaml",
+            ]
+        }
+        hints = rag_service._file_hints(
+            "Compare reranker.py with configs/retrieval.yaml",
+            report,
+        )
+        self.assertEqual(
+            hints,
+            ["src/rag_pipeline/retrieval/reranker.py", "configs/retrieval.yaml"],
+        )
+
     def test_ragignore_and_python_ast_fallback_are_visible(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -36,9 +36,6 @@ test-*.js
 *.log
 npm-debug.log*
 
-# Local Node backup (preserve locally, untracked)
-backend-node/
-
 # Python & Virtual Environments
 .venv/
 venv/

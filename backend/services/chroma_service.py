@@ -42,6 +42,12 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
         self._failed_requests = 0
         self._embedded_documents = 0
 
+    def name(self) -> str:
+        return "resilient_embedding"
+
+    def get_config(self) -> dict:
+        return {}
+
     def backend_name(self) -> str:
         if self.api_key:
             return "gemini"

@@ -274,20 +274,23 @@ def _compute_file_hash(file_path: str) -> str:
         return ""
 
 
-def _file_hint(question: str, report: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Map an explicitly named source file in a question to the indexed path."""
+def _file_hints(question: str, report: Optional[Dict[str, Any]]) -> List[str]:
+    """Map explicitly named source files in a question to indexed paths."""
     if not report:
-        return None
+        return []
     question_lower = question.lower().replace("\\", "/")
     candidates = report.get("parsedFiles") or []
-    direct = [path for path in candidates if path.lower() in question_lower]
-    if direct:
-        return max(direct, key=len)
-    names = {os.path.basename(path).lower(): path for path in candidates}
-    for name, path in names.items():
-        if name in question_lower:
-            return path
-    return None
+    return [
+        path for path in candidates
+        if path.lower() in question_lower
+        or os.path.basename(path).lower() in question_lower
+    ]
+
+
+def _file_hint(question: str, report: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the longest explicitly named source file for compatibility."""
+    hints = _file_hints(question, report)
+    return max(hints, key=len) if hints else None
 
 
 def _asks_for_signature(question: str) -> bool:
@@ -739,7 +742,8 @@ def _build_guided_change_prompt(
     )
 
 
-async def query_codebase(repo_path: Optional[str], question: str, refresh: bool = False) -> Dict[str, Any]:
+async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: bool = False) -> Dict[str, Any]:
+    """Resolve cache hits, retrieval, context, and prompt plan for both streaming and REST Q&A."""
     if not question:
         raise ValueError("Question is required.")
 
@@ -748,43 +752,51 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     cache_key = _build_cache_key(repo_path, index_id, question)
     semantic_scope = _build_semantic_cache_scope(repo_path, index_id)
 
+    # 1. Exact match cache (Tier 1)
     if not refresh:
         cached = await cache_service.get(cache_key)
         if cached and cached.get("answer"):
             logger.info(f"[Cache] Returning exact in-memory match for: '{question}'")
             return {
-                **cached,
-                "fromCache": True,
-                "cacheType": "exact_memory",
-                "confidenceLevel": cached.get("confidenceLevel", "high")
+                "type": "cache_hit",
+                "cache_type": "exact_memory",
+                "cached": cached,
+                "cache_key": cache_key,
+                "semantic_scope": semantic_scope,
             }
 
-        # Tier 2: Offline-Ready Semantic Vector Cache (ChromaDB all-MiniLM-L6-v2)
+        # 2. Semantic vector cache (Tier 2)
         semantic_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_DIRECT_THRESHOLD)
         if semantic_match and semantic_match.get("matched") and semantic_match.get("answer"):
             logger.info(
                 f"[Semantic Cache] ⚡ Returning semantic match ({semantic_match['similarity']*100:.1f}%) "
                 f"for '{question}' -> matched: '{semantic_match['matchedQuestion']}'"
             )
+            citations = [
+                f"{c.get('filePath')}:{c.get('startLine')}-{c.get('endLine')}"
+                for c in semantic_match.get("codeCitations", [])
+                if isinstance(c, dict) and c.get("filePath")
+            ]
             return {
-                "answer": semantic_match["answer"],
-                "question": question,
-                "matchedQuestion": semantic_match["matchedQuestion"],
-                "similarity": semantic_match["similarity"],
-                "confidenceLevel": semantic_match.get("confidenceLevel", "high"),
-                "fromCache": True,
-                "semanticCache": True,
-                "cacheType": "semantic_chromadb",
-                "codeMatches": semantic_match.get("codeCitations", []),
-                "diffMatches": semantic_match.get("gitCitations", []),
-                "citations": [
-                    f"{c.get('filePath')}:{c.get('startLine')}-{c.get('endLine')}"
-                    for c in semantic_match.get("codeCitations", [])
-                    if isinstance(c, dict) and c.get("filePath")
-                ]
+                "type": "semantic_hit",
+                "cache_type": "semantic_chromadb",
+                "semantic_match": semantic_match,
+                "citations": citations,
+                "cache_key": cache_key,
+                "semantic_scope": semantic_scope,
             }
 
-    # Guided Change Assistant path for task-oriented questions
+    # 3. Context & Architecture Graph
+    graph_context = ""
+    coverage_context = ""
+    if repo_path:
+        cached_graph = await cache_service.get(f"graph:{repo_path}")
+        coverage_context = _build_coverage_context(report)
+        if cached_graph and cached_graph.get("links"):
+            top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
+            graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
+
+    # 4. Task-Oriented / Guided Change
     if _is_task_oriented_question(question):
         analogous = await find_analogous_feature(repo_path, index_id, question)
         template_files = analogous.get("templateFiles", [])
@@ -792,15 +804,6 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         diff_matches = analogous.get("diffMatches", [])
         connected_links = analogous.get("connectedLinks", [])
         confidence_level = compute_confidence_level(code_matches)
-
-        graph_context = ""
-        coverage_context = ""
-        if repo_path:
-            cached_graph = await cache_service.get(f"graph:{repo_path}")
-            coverage_context = _build_coverage_context(report)
-            if cached_graph and cached_graph.get("links"):
-                top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
-                graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
 
         code_blocks_str = []
         citations = []
@@ -843,94 +846,34 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
             coverage_context=coverage_context
         )
 
-        try:
-            chat_model = get_chat_model(temperature=0.2)
-            response = await chat_model.ainvoke(system_prompt)
-            if isinstance(response.content, str):
-                answer_text = response.content
-            elif isinstance(response.content, list):
-                answer_text = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in response.content)
-            else:
-                answer_text = str(response.content)
-        except Exception as llm_error:
-            logger.warning(f"[Guided Change] LLM unavailable ({llm_error}). Checking offline semantic fallback...")
-            fallback_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
-            if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
-                return {
-                    "type": "guided_steps",
-                    "steps": fallback_match.get("steps", []),
-                    "basedOn": fallback_match.get("basedOn", template_files),
-                    "answer": fallback_match["answer"],
-                    "question": question,
-                    "confidenceLevel": fallback_match.get("confidenceLevel", "medium"),
-                    "fromCache": True,
-                    "semanticCache": True,
-                    "offlineFallback": True,
-                    "cacheType": "offline_semantic_fallback",
-                    "codeMatches": code_matches,
-                    "diffMatches": diff_matches,
-                    "citations": list(set(citations))
-                }
-            return {
-                "type": "guided_steps",
-                "steps": [],
-                "basedOn": template_files,
-                "answer": "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question.",
-                "question": question,
-                "fromCache": False,
-                "offlineNoConfidentAnswer": True,
-                "confidenceLevel": "low",
-                "codeMatches": code_matches,
-                "diffMatches": diff_matches,
-                "citations": list(set(citations))
-            }
-
-        steps = _parse_guided_steps(answer_text, template_files)
-
-        result = {
+        return {
             "type": "guided_steps",
-            "steps": steps,
-            "basedOn": template_files,
-            "answer": answer_text,
-            "question": question,
-            "confidenceLevel": confidence_level,
-            "codeMatches": code_matches,
-            "diffMatches": diff_matches,
-            "codeCitations": code_meta_list,
-            "gitCitations": git_meta_list,
-            "citations": list(set(citations))
+            "is_task_oriented": True,
+            "template_files": template_files,
+            "system_prompt": system_prompt,
+            "confidence_level": confidence_level,
+            "code_matches": code_matches,
+            "diff_matches": diff_matches,
+            "code_meta_list": code_meta_list,
+            "git_meta_list": git_meta_list,
+            "citations": list(set(citations)),
+            "cache_key": cache_key,
+            "semantic_scope": semantic_scope,
         }
 
-        await cache_service.set(cache_key, result, 86400)
-        await store_query_cache(
-            repo_path=semantic_scope,
-            question=question,
-            answer=answer_text,
-            code_citations=code_meta_list,
-            git_citations=git_meta_list
-        )
-        return result
-
-    # 1. Dual-Vector Search (Current Code + Historical Diffs)
-    file_path_hint = _file_hint(question, report)
-    profile_matches = [] if file_path_hint or not (repo_path and index_id) else await find_relevant_files(repo_path, index_id, question)
+    # 5. Dual-Vector Code & Diff Retrieval
+    file_path_hints = _file_hints(question, report)
+    file_path_hint = max(file_path_hints, key=len) if file_path_hints else None
+    profile_matches = [] if file_path_hints or not (repo_path and index_id) else await find_relevant_files(repo_path, index_id, question)
     profile_hints = [match["filePath"] for match in profile_matches if match.get("filePath")]
-    matches = await search_codebase(repo_path=repo_path, question=question, top_k=5, index_id=index_id, file_path_hint=file_path_hint, file_path_hints=profile_hints)
+    matches = await search_codebase(
+        repo_path=repo_path, question=question, top_k=5, index_id=index_id,
+        file_path_hint=file_path_hint, file_path_hints=file_path_hints + profile_hints
+    )
     code_matches = matches.get("codeMatches", [])
     diff_matches = matches.get("diffMatches", [])
     confidence_level = compute_confidence_level(code_matches)
 
-    # 2. Dependency Graph Context
-    graph_context = ""
-    coverage_context = ""
-    if repo_path:
-        cached_graph = await cache_service.get(f"graph:{repo_path}")
-        coverage_context = _build_coverage_context(report)
-        if cached_graph and cached_graph.get("links"):
-            top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
-            graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
-
-    # 3. Context Construction
     code_blocks_str = []
     citations = []
     for i, c in enumerate(code_matches):
@@ -952,19 +895,47 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
     code_context = "\n\n".join(code_blocks_str)
     diff_context = "\n\n".join(diffs_blocks_str)
 
+    code_meta_list = [
+        {
+            "filePath": c.get("metadata", {}).get("filePath"),
+            "name": c.get("metadata", {}).get("name"),
+            "startLine": c.get("metadata", {}).get("startLine"),
+            "endLine": c.get("metadata", {}).get("endLine"),
+            "snippet": (c.get("content") or "")[:300]
+        }
+        for c in code_matches
+    ]
+    git_meta_list = [
+        {
+            "hash": d.get("metadata", {}).get("hash"),
+            "author": d.get("metadata", {}).get("author"),
+            "date": d.get("metadata", {}).get("date"),
+            "summary": (d.get("content") or "")[:200]
+        }
+        for d in diff_matches
+    ]
+
     structural_evidence = any(
-        match.get("metadata", {}).get("filePath") in set(([file_path_hint] if file_path_hint else []) + profile_hints) and match.get("metadata", {}).get("type") in {"function", "arrow_function", "class"}
+        match.get("metadata", {}).get("filePath") in set(([file_path_hint] if file_path_hint else []) + profile_hints)
+        and match.get("metadata", {}).get("type") in {"function", "arrow_function", "class"}
         for match in code_matches
     )
     if file_path_hint and _asks_for_signature(question) and not structural_evidence:
+        refusal_text = f"I can confirm `{file_path_hint}` exists in the indexed repository, but I do not have its function-level AST content in the current retrieval results. I can't state its actual function signatures from this context."
         return {
-            "answer": f"I can confirm `{file_path_hint}` exists in the indexed repository, but I do not have its function-level AST content in the current retrieval results. I can't state its actual function signatures from this context.",
-            "question": question, "codeMatches": code_matches, "diffMatches": diff_matches,
-            "signatureEvidenceMissing": True,
-            "confidenceLevel": "low",
-            "citations": list(set(citations))
+            "type": "signature_refusal",
+            "refusal_text": refusal_text,
+            "confidence_level": "low",
+            "code_matches": code_matches,
+            "diff_matches": diff_matches,
+            "code_meta_list": code_meta_list,
+            "git_meta_list": git_meta_list,
+            "citations": list(set(citations)),
+            "cache_key": cache_key,
+            "semantic_scope": semantic_scope,
         }
 
+    # Strict Grounding Prompt Template (PDF Pages 110 & 114)
     system_prompt = (
         "You are RepoSage, a Principal Software Architect AI specializing in legacy codebase intelligence and architectural decision tracing.\n\n"
         "Your goal is to answer the developer's question accurately, citing specific files, functions, line numbers, and historical git reasons.\n\n"
@@ -973,7 +944,9 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         + (f"Retrieved Historical Git Changes (Why it was built this way):\n{diff_context}\n\n" if diff_context else "")
         + f"Developer Question: {question}\n\n"
         "Instructions:\n"
-        "- Explain the architectural reason and technical flow.\n"
+        "- Answer only the developer's question. Keep the answer short and easy to understand; do not add unrelated features, code, or architecture discussion.\n"
+        "- Separate facts directly shown in retrieved code from reasonable inferences. Never present an inference as a confirmed fact.\n"
+        "- Explain the architectural reason and technical flow only when it directly answers the question.\n"
         "- Reference exact file names and line ranges when discussing code.\n"
         "- Absence from retrieved snippets is NOT evidence that a component does not exist. Never state that a module/file/component is absent as a fact unless the indexed file inventory directly proves it was excluded and you explain that limitation. If evidence is incomplete, say exactly: 'I found no direct evidence in the currently indexed context; this does not prove the component is absent.'\n"
         "- When the inventory lists a relevant module but snippets were not retrieved, acknowledge the module exists in the index and avoid inventing its implementation details.\n"
@@ -984,9 +957,75 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         "Answer:"
     )
 
+    return {
+        "type": "chat",
+        "is_task_oriented": False,
+        "system_prompt": system_prompt,
+        "confidence_level": confidence_level,
+        "code_matches": code_matches,
+        "diff_matches": diff_matches,
+        "code_meta_list": code_meta_list,
+        "git_meta_list": git_meta_list,
+        "citations": list(set(citations)),
+        "cache_key": cache_key,
+        "semantic_scope": semantic_scope,
+    }
+
+
+async def query_codebase(repo_path: Optional[str], question: str, refresh: bool = False) -> Dict[str, Any]:
+    plan = await _resolve_query_plan(repo_path, question, refresh=refresh)
+    plan_type = plan["type"]
+
+    if plan_type == "cache_hit":
+        cached = plan["cached"]
+        return {
+            **cached,
+            "fromCache": True,
+            "cacheType": "exact_memory",
+            "confidenceLevel": cached.get("confidenceLevel", "high")
+        }
+
+    if plan_type == "semantic_hit":
+        sm = plan["semantic_match"]
+        return {
+            "answer": sm["answer"],
+            "question": question,
+            "matchedQuestion": sm["matchedQuestion"],
+            "similarity": sm["similarity"],
+            "confidenceLevel": sm.get("confidenceLevel", "high"),
+            "fromCache": True,
+            "semanticCache": True,
+            "cacheType": "semantic_chromadb",
+            "codeMatches": sm.get("codeCitations", []),
+            "diffMatches": sm.get("gitCitations", []),
+            "citations": plan["citations"]
+        }
+
+    if plan_type == "signature_refusal":
+        return {
+            "answer": plan["refusal_text"],
+            "question": question,
+            "codeMatches": plan["code_matches"],
+            "diffMatches": plan["diff_matches"],
+            "signatureEvidenceMissing": True,
+            "confidenceLevel": "low",
+            "citations": plan["citations"]
+        }
+
+    is_task_oriented = plan.get("is_task_oriented", False)
+    semantic_scope = plan["semantic_scope"]
+    cache_key = plan["cache_key"]
+    code_matches = plan["code_matches"]
+    diff_matches = plan["diff_matches"]
+    code_meta_list = plan["code_meta_list"]
+    git_meta_list = plan["git_meta_list"]
+    citations = plan["citations"]
+    confidence_level = plan["confidence_level"]
+    template_files = plan.get("template_files", [])
+
     try:
         chat_model = get_chat_model(temperature=0.2)
-        response = await chat_model.ainvoke(system_prompt)
+        response = await chat_model.ainvoke(plan["system_prompt"])
         if isinstance(response.content, str):
             answer_text = response.content
         elif isinstance(response.content, list):
@@ -995,10 +1034,24 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
             answer_text = str(response.content)
     except Exception as llm_error:
         logger.warning(f"[LLM] Cloud LLM unavailable ({llm_error}). Checking offline semantic fallback...")
-        # Offline Resilience: Check if we have an approximate semantic match (>= 0.65 similarity)
         fallback_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
         if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
-            logger.info(f"[Offline Mode] 🛡️ Recovered using offline semantic match: '{fallback_match['matchedQuestion']}'")
+            if is_task_oriented:
+                return {
+                    "type": "guided_steps",
+                    "steps": fallback_match.get("steps", []),
+                    "basedOn": fallback_match.get("basedOn", template_files),
+                    "answer": fallback_match["answer"],
+                    "question": question,
+                    "confidenceLevel": fallback_match.get("confidenceLevel", "medium"),
+                    "fromCache": True,
+                    "semanticCache": True,
+                    "offlineFallback": True,
+                    "cacheType": "offline_semantic_fallback",
+                    "codeMatches": code_matches,
+                    "diffMatches": diff_matches,
+                    "citations": citations
+                }
             return {
                 "answer": (
                     f"> ⚡ **[Offline Mode Active]** Network connection to cloud LLM is offline. "
@@ -1015,10 +1068,16 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
                 "cacheType": "offline_semantic_fallback",
                 "codeMatches": code_matches,
                 "diffMatches": diff_matches,
-                "citations": list(set(citations))
+                "citations": citations
             }
-        return {
-            "answer": "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question. It will not show a loosely related answer as if it were yours. Please retry when the LLM is available.",
+
+        no_confident_msg = (
+            "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question."
+            if is_task_oriented else
+            "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question. It will not show a loosely related answer as if it were yours. Please retry when the LLM is available."
+        )
+        res = {
+            "answer": no_confident_msg,
             "question": question,
             "fromCache": False,
             "offlineNoConfidentAnswer": True,
@@ -1026,31 +1085,15 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
             "cacheType": "offline_no_confident_match",
             "codeMatches": code_matches,
             "diffMatches": diff_matches,
-            "citations": list(set(citations))
+            "citations": citations
         }
+        if is_task_oriented:
+            res["type"] = "guided_steps"
+            res["steps"] = []
+            res["basedOn"] = template_files
+        return res
 
-    code_meta_list = [
-        {
-            "filePath": c.get("metadata", {}).get("filePath"),
-            "name": c.get("metadata", {}).get("name"),
-            "startLine": c.get("metadata", {}).get("startLine"),
-            "endLine": c.get("metadata", {}).get("endLine"),
-            "snippet": (c.get("content") or "")[:300]
-        }
-        for c in code_matches
-    ]
-
-    git_meta_list = [
-        {
-            "hash": d.get("metadata", {}).get("hash"),
-            "author": d.get("metadata", {}).get("author"),
-            "date": d.get("metadata", {}).get("date"),
-            "summary": (d.get("content") or "")[:200]
-        }
-        for d in diff_matches
-    ]
-
-    result = {
+    result: Dict[str, Any] = {
         "answer": answer_text,
         "question": question,
         "confidenceLevel": confidence_level,
@@ -1058,13 +1101,14 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         "diffMatches": diff_matches,
         "codeCitations": code_meta_list,
         "gitCitations": git_meta_list,
-        "citations": list(set(citations))
+        "citations": citations
     }
+    if is_task_oriented:
+        result["type"] = "guided_steps"
+        result["steps"] = _parse_guided_steps(answer_text, template_files)
+        result["basedOn"] = template_files
 
-    # Cache in memory (fast exact tier)
     await cache_service.set(cache_key, result, 86400)
-
-    # Cache in ChromaDB reposage_queries (Local Semantic Vector Tier)
     await store_query_cache(
         repo_path=semantic_scope,
         question=question,
@@ -1072,173 +1116,140 @@ async def query_codebase(repo_path: Optional[str], question: str, refresh: bool 
         code_citations=code_meta_list,
         git_citations=git_meta_list
     )
-
     return result
 
 
-async def stream_query_codebase(repo_path: Optional[str], question: str, refresh: bool = False) -> AsyncGenerator[Dict[str, Any], None]:
+async def stream_query_codebase(
+    repo_path: Optional[str],
+    question: str,
+    refresh: bool = False
+) -> AsyncGenerator[Dict[str, Any], None]:
     """Stream answer generation token-by-token using SSE while preserving caching and calibration."""
-    if not question:
-        raise ValueError("Question is required.")
+    plan = await _resolve_query_plan(repo_path, question, refresh=refresh)
+    plan_type = plan["type"]
 
-    report = await cache_service.get(f"ingestion_report:{repo_path}") if repo_path else None
-    index_id = report.get("indexId") if report else None
-    cache_key = _build_cache_key(repo_path, index_id, question)
-    semantic_scope = _build_semantic_cache_scope(repo_path, index_id)
-
-    if not refresh:
-        cached = await cache_service.get(cache_key)
-        if cached and cached.get("answer"):
-            logger.info(f"[Cache] Returning exact in-memory match for streaming: '{question}'")
-            yield {
-                "type": "meta",
-                "responseType": cached.get("type", "chat"),
-                "fromCache": True,
-                "cacheType": "exact_memory",
-                "confidenceLevel": cached.get("confidenceLevel", "high"),
-                "basedOn": cached.get("basedOn", []),
-                "steps": cached.get("steps", []),
-                "codeCitations": cached.get("codeCitations", []),
-                "gitCitations": cached.get("gitCitations", []),
-                "citations": cached.get("citations", []),
-                "matchedQuestion": cached.get("matchedQuestion")
-            }
-            yield {"type": "token", "token": cached["answer"]}
-            yield {
-                "type": "done",
-                **cached,
-                "fromCache": True,
-                "cacheType": "exact_memory",
-                "confidenceLevel": cached.get("confidenceLevel", "high")
-            }
-            return
-
-        semantic_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_DIRECT_THRESHOLD)
-        if semantic_match and semantic_match.get("matched") and semantic_match.get("answer"):
-            logger.info(
-                f"[Semantic Cache] ⚡ Returning semantic match ({semantic_match['similarity']*100:.1f}%) "
-                f"for streaming: '{question}' -> matched: '{semantic_match['matchedQuestion']}'"
-            )
-            citations = [
-                f"{c.get('filePath')}:{c.get('startLine')}-{c.get('endLine')}"
-                for c in semantic_match.get("codeCitations", [])
-                if isinstance(c, dict) and c.get("filePath")
-            ]
-            yield {
-                "type": "meta",
-                "fromCache": True,
-                "semanticCache": True,
-                "cacheType": "semantic_chromadb",
-                "confidenceLevel": semantic_match.get("confidenceLevel", "high"),
-                "similarity": semantic_match.get("similarity"),
-                "matchedQuestion": semantic_match.get("matchedQuestion"),
-                "codeCitations": semantic_match.get("codeCitations", []),
-                "gitCitations": semantic_match.get("gitCitations", []),
-                "citations": citations
-            }
-            yield {"type": "token", "token": semantic_match["answer"]}
-            yield {
-                "type": "done",
-                "answer": semantic_match["answer"],
-                "question": question,
-                "matchedQuestion": semantic_match["matchedQuestion"],
-                "similarity": semantic_match["similarity"],
-                "confidenceLevel": semantic_match.get("confidenceLevel", "high"),
-                "fromCache": True,
-                "semanticCache": True,
-                "cacheType": "semantic_chromadb",
-                "codeCitations": semantic_match.get("codeCitations", []),
-                "gitCitations": semantic_match.get("gitCitations", []),
-                "citations": citations
-            }
-            return
-
-    # Guided Change Assistant path for task-oriented questions
-    if _is_task_oriented_question(question):
-        analogous = await find_analogous_feature(repo_path, index_id, question)
-        template_files = analogous.get("templateFiles", [])
-        code_matches = analogous.get("codeMatches", [])
-        diff_matches = analogous.get("diffMatches", [])
-        connected_links = analogous.get("connectedLinks", [])
-        confidence_level = compute_confidence_level(code_matches)
-
-        graph_context = ""
-        coverage_context = ""
-        if repo_path:
-            cached_graph = await cache_service.get(f"graph:{repo_path}")
-            coverage_context = _build_coverage_context(report)
-            if cached_graph and cached_graph.get("links"):
-                top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
-                graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
-
-        code_blocks_str = []
-        citations = []
-        for i, c in enumerate(code_matches):
-            meta = c.get("metadata", {})
-            fp = meta.get("filePath", "unknown")
-            s = meta.get("startLine", 1)
-            e = meta.get("endLine", 1)
-            citations.append(f"{fp}:{s}-{e}")
-            code_blocks_str.append(f"[Code Block {i+1}] File: {fp} (Lines {s}-{e}):\n```\n{c.get('content')}\n```")
-
-        code_context = "\n\n".join(code_blocks_str)
-
-        code_meta_list = [
-            {
-                "filePath": c.get("metadata", {}).get("filePath"),
-                "name": c.get("metadata", {}).get("name"),
-                "startLine": c.get("metadata", {}).get("startLine"),
-                "endLine": c.get("metadata", {}).get("endLine"),
-                "snippet": (c.get("content") or "")[:300]
-            }
-            for c in code_matches
-        ]
-        git_meta_list = [
-            {
-                "hash": d.get("metadata", {}).get("hash"),
-                "author": d.get("metadata", {}).get("author"),
-                "date": d.get("metadata", {}).get("date"),
-                "summary": (d.get("content") or "")[:200]
-            }
-            for d in diff_matches
-        ]
-
+    if plan_type == "cache_hit":
+        cached = plan["cached"]
+        logger.info(f"[Cache] Returning exact in-memory match for streaming: '{question}'")
         yield {
             "type": "meta",
-            "responseType": "guided_steps",
-            "confidenceLevel": confidence_level,
-            "basedOn": template_files,
-            "codeCitations": code_meta_list,
-            "gitCitations": git_meta_list,
-            "citations": list(set(citations))
+            "responseType": cached.get("type", "chat"),
+            "fromCache": True,
+            "cacheType": "exact_memory",
+            "confidenceLevel": cached.get("confidenceLevel", "high"),
+            "basedOn": cached.get("basedOn", []),
+            "steps": cached.get("steps", []),
+            "codeCitations": cached.get("codeCitations", []),
+            "gitCitations": cached.get("gitCitations", []),
+            "citations": cached.get("citations", []),
+            "matchedQuestion": cached.get("matchedQuestion")
         }
+        yield {"type": "token", "token": cached["answer"]}
+        yield {
+            "type": "done",
+            **cached,
+            "fromCache": True,
+            "cacheType": "exact_memory",
+            "confidenceLevel": cached.get("confidenceLevel", "high")
+        }
+        return
 
-        system_prompt = _build_guided_change_prompt(
-            question=question,
-            template_files=template_files,
-            connected_links=connected_links,
-            code_context=code_context,
-            graph_context=graph_context,
-            coverage_context=coverage_context
-        )
+    if plan_type == "semantic_hit":
+        sm = plan["semantic_match"]
+        citations = plan["citations"]
+        yield {
+            "type": "meta",
+            "fromCache": True,
+            "semanticCache": True,
+            "cacheType": "semantic_chromadb",
+            "confidenceLevel": sm.get("confidenceLevel", "high"),
+            "similarity": sm.get("similarity"),
+            "matchedQuestion": sm.get("matchedQuestion"),
+            "codeCitations": sm.get("codeCitations", []),
+            "gitCitations": sm.get("gitCitations", []),
+            "citations": citations
+        }
+        yield {"type": "token", "token": sm["answer"]}
+        yield {
+            "type": "done",
+            "answer": sm["answer"],
+            "question": question,
+            "matchedQuestion": sm["matchedQuestion"],
+            "similarity": sm["similarity"],
+            "confidenceLevel": sm.get("confidenceLevel", "high"),
+            "fromCache": True,
+            "semanticCache": True,
+            "cacheType": "semantic_chromadb",
+            "codeCitations": sm.get("codeCitations", []),
+            "gitCitations": sm.get("gitCitations", []),
+            "citations": citations
+        }
+        return
 
-        full_chunks = []
-        try:
-            chat_model = get_chat_model(temperature=0.2)
-            async for chunk in chat_model.astream(system_prompt):
-                content = chunk.content if hasattr(chunk, "content") else str(chunk)
-                if isinstance(content, list):
-                    text_chunk = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
-                else:
-                    text_chunk = str(content)
-                if text_chunk:
-                    full_chunks.append(text_chunk)
-                    yield {"type": "token", "token": text_chunk}
-            answer_text = "".join(full_chunks)
-        except Exception as llm_error:
-            logger.warning(f"[Guided Change] LLM stream error: {llm_error}")
-            fallback_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
-            if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
+    if plan_type == "signature_refusal":
+        refusal_text = plan["refusal_text"]
+        yield {
+            "type": "meta",
+            "signatureEvidenceMissing": True,
+            "confidenceLevel": "low",
+            "codeCitations": plan["code_meta_list"],
+            "gitCitations": plan["git_meta_list"],
+            "citations": plan["citations"]
+        }
+        yield {"type": "token", "token": refusal_text}
+        yield {
+            "type": "done",
+            "answer": refusal_text,
+            "question": question,
+            "codeMatches": plan["code_matches"],
+            "diffMatches": plan["diff_matches"],
+            "signatureEvidenceMissing": True,
+            "confidenceLevel": "low",
+            "citations": plan["citations"]
+        }
+        return
+
+    is_task_oriented = plan.get("is_task_oriented", False)
+    semantic_scope = plan["semantic_scope"]
+    cache_key = plan["cache_key"]
+    code_matches = plan["code_matches"]
+    diff_matches = plan["diff_matches"]
+    code_meta_list = plan["code_meta_list"]
+    git_meta_list = plan["git_meta_list"]
+    citations = plan["citations"]
+    confidence_level = plan["confidence_level"]
+    template_files = plan.get("template_files", [])
+
+    meta_event = {
+        "type": "meta",
+        "confidenceLevel": confidence_level,
+        "codeCitations": code_meta_list,
+        "gitCitations": git_meta_list,
+        "citations": citations
+    }
+    if is_task_oriented:
+        meta_event["responseType"] = "guided_steps"
+        meta_event["basedOn"] = template_files
+    yield meta_event
+
+    full_chunks = []
+    try:
+        chat_model = get_chat_model(temperature=0.2)
+        async for chunk in chat_model.astream(plan["system_prompt"]):
+            content = chunk.content if hasattr(chunk, "content") else str(chunk)
+            if isinstance(content, list):
+                text_chunk = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
+            else:
+                text_chunk = str(content)
+            if text_chunk:
+                full_chunks.append(text_chunk)
+                yield {"type": "token", "token": text_chunk}
+        answer_text = "".join(full_chunks)
+    except Exception as llm_error:
+        logger.warning(f"[LLM] Stream error ({llm_error}). Checking offline semantic fallback...")
+        fallback_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
+        if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
+            if is_task_oriented:
                 yield {"type": "token", "token": fallback_match["answer"]}
                 yield {
                     "type": "done",
@@ -1252,189 +1263,9 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
                     "semanticCache": True,
                     "offlineFallback": True,
                     "cacheType": "offline_semantic_fallback",
-                    "citations": list(set(citations))
+                    "citations": citations
                 }
                 return
-
-            no_ans = "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question."
-            yield {"type": "token", "token": no_ans}
-            yield {
-                "type": "done",
-                "responseType": "guided_steps",
-                "steps": [],
-                "basedOn": template_files,
-                "answer": no_ans,
-                "question": question,
-                "fromCache": False,
-                "offlineNoConfidentAnswer": True,
-                "confidenceLevel": "low",
-                "cacheType": "offline_no_confident_match",
-                "citations": list(set(citations))
-            }
-            return
-
-        steps = _parse_guided_steps(answer_text, template_files)
-        result = {
-            "type": "guided_steps",
-            "steps": steps,
-            "basedOn": template_files,
-            "answer": answer_text,
-            "question": question,
-            "confidenceLevel": confidence_level,
-            "codeMatches": code_matches,
-            "diffMatches": diff_matches,
-            "codeCitations": code_meta_list,
-            "gitCitations": git_meta_list,
-            "citations": list(set(citations))
-        }
-
-        await cache_service.set(cache_key, result, 86400)
-        await store_query_cache(
-            repo_path=semantic_scope,
-            question=question,
-            answer=answer_text,
-            code_citations=code_meta_list,
-            git_citations=git_meta_list
-        )
-
-        yield {"type": "done", **result}
-        return
-
-    # Dual-Vector Search
-    file_path_hint = _file_hint(question, report)
-    profile_matches = [] if file_path_hint or not (repo_path and index_id) else await find_relevant_files(repo_path, index_id, question)
-    profile_hints = [match["filePath"] for match in profile_matches if match.get("filePath")]
-    matches = await search_codebase(repo_path=repo_path, question=question, top_k=5, index_id=index_id, file_path_hint=file_path_hint, file_path_hints=profile_hints)
-    code_matches = matches.get("codeMatches", [])
-    diff_matches = matches.get("diffMatches", [])
-    confidence_level = compute_confidence_level(code_matches)
-
-    # Dependency Graph Context
-    graph_context = ""
-    coverage_context = ""
-    if repo_path:
-        cached_graph = await cache_service.get(f"graph:{repo_path}")
-        coverage_context = _build_coverage_context(report)
-        if cached_graph and cached_graph.get("links"):
-            top_links = "\n".join(f"{l['source']} -> {l['target']}" for l in cached_graph["links"][:10])
-            graph_context = f"Known Architecture Connections:\n{top_links}\n\n"
-
-    # Context Construction
-    code_blocks_str = []
-    citations = []
-    for i, c in enumerate(code_matches):
-        meta = c.get("metadata", {})
-        fp = meta.get("filePath", "unknown")
-        s = meta.get("startLine", 1)
-        e = meta.get("endLine", 1)
-        citations.append(f"{fp}:{s}-{e}")
-        code_blocks_str.append(f"[Code Block {i+1}] File: {fp} (Lines {s}-{e}):\n```\n{c.get('content')}\n```")
-
-    diffs_blocks_str = []
-    for i, d in enumerate(diff_matches):
-        meta = d.get("metadata", {})
-        diffs_blocks_str.append(
-            f"[Git Archaeology {i+1}] Commit: {meta.get('hash')} by {meta.get('author')} ({meta.get('date')}):\n"
-            f"Intent Summary: {d.get('content')}"
-        )
-
-    code_context = "\n\n".join(code_blocks_str)
-    diff_context = "\n\n".join(diffs_blocks_str)
-
-    code_meta_list = [
-        {
-            "filePath": c.get("metadata", {}).get("filePath"),
-            "name": c.get("metadata", {}).get("name"),
-            "startLine": c.get("metadata", {}).get("startLine"),
-            "endLine": c.get("metadata", {}).get("endLine"),
-            "snippet": (c.get("content") or "")[:300]
-        }
-        for c in code_matches
-    ]
-
-    git_meta_list = [
-        {
-            "hash": d.get("metadata", {}).get("hash"),
-            "author": d.get("metadata", {}).get("author"),
-            "date": d.get("metadata", {}).get("date"),
-            "summary": (d.get("content") or "")[:200]
-        }
-        for d in diff_matches
-    ]
-
-    structural_evidence = any(
-        match.get("metadata", {}).get("filePath") in set(([file_path_hint] if file_path_hint else []) + profile_hints) and match.get("metadata", {}).get("type") in {"function", "arrow_function", "class"}
-        for match in code_matches
-    )
-    if file_path_hint and _asks_for_signature(question) and not structural_evidence:
-        refusal_text = f"I can confirm `{file_path_hint}` exists in the indexed repository, but I do not have its function-level AST content in the current retrieval results. I can't state its actual function signatures from this context."
-        yield {
-            "type": "meta",
-            "signatureEvidenceMissing": True,
-            "confidenceLevel": "low",
-            "codeCitations": code_meta_list,
-            "gitCitations": git_meta_list,
-            "citations": list(set(citations))
-        }
-        yield {"type": "token", "token": refusal_text}
-        yield {
-            "type": "done",
-            "answer": refusal_text,
-            "question": question,
-            "codeMatches": code_matches,
-            "diffMatches": diff_matches,
-            "signatureEvidenceMissing": True,
-            "confidenceLevel": "low",
-            "citations": list(set(citations))
-        }
-        return
-
-    # Yield early metadata so frontend can render citations immediately
-    yield {
-        "type": "meta",
-        "confidenceLevel": confidence_level,
-        "codeCitations": code_meta_list,
-        "gitCitations": git_meta_list,
-        "citations": list(set(citations))
-    }
-
-    system_prompt = (
-        "You are RepoSage, a Principal Software Architect AI specializing in legacy codebase intelligence and architectural decision tracing.\n\n"
-        "Your goal is to answer the developer's question accurately, citing specific files, functions, line numbers, and historical git reasons.\n\n"
-        f"Repository Context:\n{graph_context}\n{coverage_context}\n\n"
-        f"Retrieved Code Implementations:\n{code_context}\n\n"
-        + (f"Retrieved Historical Git Changes (Why it was built this way):\n{diff_context}\n\n" if diff_context else "")
-        + f"Developer Question: {question}\n\n"
-        "Instructions:\n"
-        "- Explain the architectural reason and technical flow.\n"
-        "- Reference exact file names and line ranges when discussing code.\n"
-        "- Absence from retrieved snippets is NOT evidence that a component does not exist. Never state that a module/file/component is absent as a fact unless the indexed file inventory directly proves it was excluded and you explain that limitation. If evidence is incomplete, say exactly: 'I found no direct evidence in the currently indexed context; this does not prove the component is absent.'\n"
-        "- When the inventory lists a relevant module but snippets were not retrieved, acknowledge the module exists in the index and avoid inventing its implementation details.\n"
-        "- Do not state a function name, parameter name, or signature unless the exact declaration is present verbatim in Retrieved Code Implementations. If structural code for a named file is unavailable, state that you cannot confirm its actual signature.\n"
-        f"- Semantic file-routing candidates for this question: {', '.join(profile_hints) or 'none'}. These candidates only guide retrieval; cite retrieved code, not the candidate list.\n"
-        "- If historical diffs provide context on WHY a decision or change was made, highlight it under a '🏛️ Architectural Decision History' section.\n"
-        "- Use clean Markdown format with code snippets where helpful.\n\n"
-        "Answer:"
-    )
-
-    full_chunks = []
-    try:
-        chat_model = get_chat_model(temperature=0.2)
-        async for chunk in chat_model.astream(system_prompt):
-            content = chunk.content if hasattr(chunk, "content") else str(chunk)
-            if isinstance(content, list):
-                text_chunk = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
-            else:
-                text_chunk = str(content)
-            if text_chunk:
-                full_chunks.append(text_chunk)
-                yield {"type": "token", "token": text_chunk}
-        answer_text = "".join(full_chunks)
-    except Exception as llm_error:
-        logger.warning(f"[LLM] Cloud LLM unavailable ({llm_error}). Checking offline semantic fallback...")
-        fallback_match = await find_semantic_query_match(semantic_scope, question, threshold=SEMANTIC_CACHE_OFFLINE_THRESHOLD)
-        if fallback_match and fallback_match.get("matched") and fallback_match.get("answer"):
-            logger.info(f"[Offline Mode] 🛡️ Recovered using offline semantic match: '{fallback_match['matchedQuestion']}'")
             fallback_answer = (
                 f"> ⚡ **[Offline Mode Active]** Network connection to cloud LLM is offline. "
                 f"Showing nearest semantic match ({fallback_match['similarity']*100:.1f}% match to: *\"{fallback_match['matchedQuestion']}\"*):\n\n"
@@ -1452,13 +1283,17 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
                 "semanticCache": True,
                 "offlineFallback": True,
                 "cacheType": "offline_semantic_fallback",
-                "citations": list(set(citations))
+                "citations": citations
             }
             return
-        
-        no_ans = "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question. It will not show a loosely related answer as if it were yours. Please retry when the LLM is available."
+
+        no_ans = (
+            "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question."
+            if is_task_oriented else
+            "## No confident answer available\n\nRepoSage could not reach the live LLM, and no cached answer met the 80% similarity safety threshold for this question. It will not show a loosely related answer as if it were yours. Please retry when the LLM is available."
+        )
         yield {"type": "token", "token": no_ans}
-        yield {
+        done_event = {
             "type": "done",
             "answer": no_ans,
             "question": question,
@@ -1466,8 +1301,13 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
             "offlineNoConfidentAnswer": True,
             "confidenceLevel": "low",
             "cacheType": "offline_no_confident_match",
-            "citations": list(set(citations))
+            "citations": citations
         }
+        if is_task_oriented:
+            done_event["responseType"] = "guided_steps"
+            done_event["steps"] = []
+            done_event["basedOn"] = template_files
+        yield done_event
         return
 
     result = {
@@ -1478,13 +1318,14 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
         "diffMatches": diff_matches,
         "codeCitations": code_meta_list,
         "gitCitations": git_meta_list,
-        "citations": list(set(citations))
+        "citations": citations
     }
+    if is_task_oriented:
+        result["type"] = "guided_steps"
+        result["steps"] = _parse_guided_steps(answer_text, template_files)
+        result["basedOn"] = template_files
 
-    # Cache in memory (fast exact tier)
     await cache_service.set(cache_key, result, 86400)
-
-    # Cache in ChromaDB reposage_queries (Local Semantic Vector Tier)
     await store_query_cache(
         repo_path=semantic_scope,
         question=question,
@@ -1494,4 +1335,3 @@ async def stream_query_codebase(repo_path: Optional[str], question: str, refresh
     )
 
     yield {"type": "done", **result}
-
