@@ -321,6 +321,53 @@ def _focused_file_matches(repo_path: Optional[str], file_paths: List[str]) -> Li
     return matches
 
 
+def _usage_identifiers(question: str) -> List[str]:
+    if not re.search(r"\b(unused|dead|active|used|usage|reference|imported|enforc)", question, re.IGNORECASE):
+        return []
+    identifiers = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", question)
+    return list(dict.fromkeys(identifiers))[:3]
+
+
+def _reference_matches(
+    repo_path: Optional[str],
+    report: Optional[Dict[str, Any]],
+    question: str,
+) -> List[Dict[str, Any]]:
+    """Find bounded, exact symbol references for usage questions."""
+    identifiers = _usage_identifiers(question)
+    if not repo_path or not report or not identifiers:
+        return []
+
+    root = os.path.abspath(repo_path)
+    matches = []
+    for relative_path in (report.get("parsedFiles") or [])[:200]:
+        full_path = os.path.abspath(os.path.join(root, relative_path))
+        if os.path.commonpath([root, full_path]) != root or not os.path.isfile(full_path):
+            continue
+        try:
+            with open(full_path, encoding="utf-8", errors="ignore") as source:
+                for line_number, line in enumerate(source, 1):
+                    if any(re.search(rf"\b{re.escape(identifier)}\b", line) for identifier in identifiers):
+                        matches.append({
+                            "type": "reference",
+                            "content": line.strip(),
+                            "metadata": {
+                                "filePath": relative_path,
+                                "type": "reference",
+                                "name": next(
+                                    identifier for identifier in identifiers
+                                    if re.search(rf"\b{re.escape(identifier)}\b", line)
+                                ),
+                                "startLine": line_number,
+                                "endLine": line_number,
+                            },
+                            "distance": 0.0,
+                        })
+        except OSError:
+            continue
+    return matches[:80]
+
+
 def _asks_for_signature(question: str) -> bool:
     lowered = question.lower()
     return any(term in lowered for term in ("signature", "parameters", "arguments", "function name", "method name", "function does", "internals"))
@@ -899,7 +946,8 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
         file_path_hint=file_path_hint, file_path_hints=file_path_hints + profile_hints
     )
     focused_matches = _focused_file_matches(repo_path, file_path_hints)
-    retrieved_matches = focused_matches + matches.get("codeMatches", [])
+    reference_matches = _reference_matches(repo_path, report, question)
+    retrieved_matches = focused_matches + reference_matches + matches.get("codeMatches", [])
     seen_matches = set()
     code_matches = []
     for match in retrieved_matches:
@@ -914,6 +962,8 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
             code_matches.append(match)
     diff_matches = matches.get("diffMatches", [])
     confidence_level = compute_confidence_level(code_matches)
+    if file_path_hints and not focused_matches:
+        confidence_level = "low"
 
     code_blocks_str = []
     citations = []

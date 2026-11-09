@@ -118,6 +118,22 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(matches[0]["metadata"]["filePath"], "backend/validators/chat.schema.js")
             self.assertIn("chatSchema", matches[0]["content"])
 
+    def test_usage_questions_collect_exact_symbol_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route = root / "routes.js"
+            schema = root / "schema.js"
+            route.write_text("validate(chatSchema, 'body');\n", encoding="utf-8")
+            schema.write_text("export const chatWithImageSchema = chatSchema;\n", encoding="utf-8")
+            report = {"parsedFiles": ["routes.js", "schema.js"]}
+            matches = rag_service._reference_matches(
+                directory,
+                report,
+                "Is `chatWithImageSchema` active or unused?",
+            )
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["metadata"]["filePath"], "schema.js")
+
     def test_ragignore_and_python_ast_fallback_are_visible(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
