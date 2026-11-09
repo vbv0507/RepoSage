@@ -102,6 +102,22 @@ class ReliabilityTests(unittest.TestCase):
             ["src/rag_pipeline/retrieval/reranker.py", "configs/retrieval.yaml"],
         )
 
+    def test_named_file_matches_are_read_directly_for_grounding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "backend" / "validators" / "chat.schema.js"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(
+                "export const chatSchema = z.object({ conversationId: z.string() });\n",
+                encoding="utf-8",
+            )
+            matches = rag_service._focused_file_matches(
+                directory,
+                ["backend/validators/chat.schema.js"],
+            )
+            self.assertEqual(matches[0]["metadata"]["filePath"], "backend/validators/chat.schema.js")
+            self.assertIn("chatSchema", matches[0]["content"])
+
     def test_ragignore_and_python_ast_fallback_are_visible(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

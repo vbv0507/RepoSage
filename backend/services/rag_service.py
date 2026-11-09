@@ -293,6 +293,34 @@ def _file_hint(question: str, report: Optional[Dict[str, Any]]) -> Optional[str]
     return max(hints, key=len) if hints else None
 
 
+def _focused_file_matches(repo_path: Optional[str], file_paths: List[str]) -> List[Dict[str, Any]]:
+    """Read a small set of explicitly named indexed files for exact grounding."""
+    if not repo_path or not file_paths:
+        return []
+
+    root = os.path.abspath(repo_path)
+    matches = []
+    for relative_path in file_paths[:5]:
+        full_path = os.path.abspath(os.path.join(root, relative_path))
+        if os.path.commonpath([root, full_path]) != root or not os.path.isfile(full_path):
+            continue
+        parsed = parse_code_file(full_path, root)
+        for chunk in parsed.get("chunks", [])[:40]:
+            matches.append({
+                "type": "code",
+                "content": chunk.get("code", ""),
+                "metadata": {
+                    "filePath": chunk.get("filePath", relative_path),
+                    "type": chunk.get("type", "block"),
+                    "name": chunk.get("name"),
+                    "startLine": chunk.get("startLine", 1),
+                    "endLine": chunk.get("endLine", 1),
+                },
+                "distance": 0.0,
+            })
+    return matches
+
+
 def _asks_for_signature(question: str) -> bool:
     lowered = question.lower()
     return any(term in lowered for term in ("signature", "parameters", "arguments", "function name", "method name", "function does", "internals"))
@@ -870,7 +898,20 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
         repo_path=repo_path, question=question, top_k=5, index_id=index_id,
         file_path_hint=file_path_hint, file_path_hints=file_path_hints + profile_hints
     )
-    code_matches = matches.get("codeMatches", [])
+    focused_matches = _focused_file_matches(repo_path, file_path_hints)
+    retrieved_matches = focused_matches + matches.get("codeMatches", [])
+    seen_matches = set()
+    code_matches = []
+    for match in retrieved_matches:
+        metadata = match.get("metadata", {})
+        key = (
+            metadata.get("filePath"),
+            metadata.get("startLine"),
+            metadata.get("endLine"),
+        )
+        if key not in seen_matches:
+            seen_matches.add(key)
+            code_matches.append(match)
     diff_matches = matches.get("diffMatches", [])
     confidence_level = compute_confidence_level(code_matches)
 
