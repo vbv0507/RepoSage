@@ -54,6 +54,21 @@ class CapturingModel:
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_hash_embedding_backend_bypasses_gemini(self):
+        with patch.dict(
+            os.environ,
+            {"EMBEDDING_BACKEND": "hash", "GEMINI_API_KEY": "test-key"},
+            clear=False,
+        ), patch.object(chroma_service.requests, "post") as post:
+            embedding_function = chroma_service.ResilientEmbeddingFunction()
+            vectors = embedding_function(["first document", "second document"])
+
+        self.assertEqual(embedding_function.backend_name(), "hash")
+        self.assertEqual(len(vectors), 2)
+        self.assertEqual(len(vectors[0]), 384)
+        self.assertAlmostEqual(sum(value * value for value in vectors[0]), 1.0, places=5)
+        post.assert_not_called()
+
     def test_retrieval_module_is_discovered_and_limit_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -100,6 +115,33 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(
             hints,
             ["src/rag_pipeline/retrieval/reranker.py", "configs/retrieval.yaml"],
+        )
+
+    def test_runtime_retrieval_question_routes_to_active_modules(self):
+        report = {
+            "parsedFiles": [
+                "README.md",
+                "configs/retrieval.yaml",
+                "src/rag_pipeline/config/settings.py",
+                "src/rag_pipeline/retrieval/pipeline.py",
+                "src/rag_pipeline/retrieval/vector_store.py",
+                "src/rag_pipeline/retrieval/reranker.py",
+            ]
+        }
+        hints = rag_service._topic_file_hints(
+            "What runtime retrieval and reranking behavior is actually active?",
+            report,
+        )
+        self.assertIn("src/rag_pipeline/config/settings.py", hints)
+        self.assertIn("src/rag_pipeline/retrieval/pipeline.py", hints)
+        self.assertIn("src/rag_pipeline/retrieval/vector_store.py", hints)
+        self.assertIn("src/rag_pipeline/retrieval/reranker.py", hints)
+
+    def test_bounded_context_marks_omitted_evidence(self):
+        bounded = rag_service._bounded_context("abcdef", limit=3)
+        self.assertEqual(
+            bounded,
+            "abc\n\n[Additional retrieved context omitted due to context limit.]",
         )
 
     def test_named_file_matches_are_read_directly_for_grounding(self):

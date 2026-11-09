@@ -33,6 +33,7 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
     """
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+        self.embedding_backend = os.getenv("EMBEDDING_BACKEND", "auto").strip().lower()
         self.preferred_model = None
         self._onnx_lock = threading.Lock()
         self._rate_lock = threading.Lock()
@@ -49,6 +50,8 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
         return {}
 
     def backend_name(self) -> str:
+        if self.embedding_backend in {"gemini", "local", "hash"}:
+            return self.embedding_backend
         if self.api_key:
             return "gemini"
         return "onnx" if semantic_cache_enabled() else "hash"
@@ -119,6 +122,17 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
         raise EmbeddingBackendUnavailable(f"Gemini embeddings unavailable after retries: {last_error}")
 
     def __call__(self, input: Documents) -> Embeddings:
+        if self.backend_name() == "hash":
+            return self._embed_hash(input)
+
+        if self.backend_name() == "local":
+            return self._embed_local(input)
+
+        if self.backend_name() == "gemini" and not self.api_key:
+            raise EmbeddingBackendUnavailable(
+                "EMBEDDING_BACKEND=gemini requires GEMINI_API_KEY or GOOGLE_API_KEY."
+            )
+
         # A collection receives vectors from exactly one backend. Gemini errors
         # must fail the batch rather than silently inserting hash vectors.
         if self.api_key:
@@ -137,19 +151,23 @@ class ResilientEmbeddingFunction(EmbeddingFunction):
                     continue
             raise EmbeddingBackendUnavailable("No configured Gemini embedding model is available")
 
-        # Local ONNX is optional on constrained Render instances.  With semantic
-        # caching off, use deterministic hash vectors instead of loading MiniLM.
         if semantic_cache_enabled():
-            try:
-                with self._onnx_lock:
-                    logger.warning("[ChromaDB] Gemini embedding unavailable. Falling back to local ONNX embeddings (all-MiniLM-L6-v2).")
-                    local_ef = get_local_query_embedding_function()
-                    if local_ef is not None and not isinstance(local_ef, ResilientEmbeddingFunction):
-                        return local_ef(input)
-            except Exception as onnx_err:
-                raise EmbeddingBackendUnavailable(f"Local ONNX embeddings failed: {onnx_err}") from onnx_err
+            return self._embed_local(input)
+        return self._embed_hash(input)
 
-        # 3. Emergency Normalized Hash Vector (384 dimensions matching collection dimension)
+    def _embed_local(self, input: Documents) -> Embeddings:
+        try:
+            with self._onnx_lock:
+                local_ef = get_local_query_embedding_function()
+                if local_ef is not None and not isinstance(local_ef, ResilientEmbeddingFunction):
+                    return local_ef(input)
+        except Exception as onnx_err:
+            raise EmbeddingBackendUnavailable(f"Local ONNX embeddings failed: {onnx_err}") from onnx_err
+        raise EmbeddingBackendUnavailable("Local ONNX embedding backend is unavailable.")
+
+    @staticmethod
+    def _embed_hash(input: Documents) -> Embeddings:
+        # Deterministic normalized hash vectors keep local indexing lightweight.
         results = []
         for text in input:
             vec = [0.0] * 384

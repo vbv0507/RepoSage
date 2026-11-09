@@ -29,6 +29,7 @@ WINDOWS_PATH = re.compile(r"^[a-zA-Z]:[\\\\/]")
 UPLOAD_REPO_PREFIX = "upload://"
 CLONED_REPO_ROOT = os.getenv("CLONED_REPO_ROOT", "/tmp/reposage_clones")
 MAX_CHUNKS_PER_REPO = int(os.getenv("MAX_CHUNKS_PER_REPO", "500"))
+MAX_PROMPT_CONTEXT_CHARS = int(os.getenv("MAX_PROMPT_CONTEXT_CHARS", "30000"))
 SEMANTIC_CACHE_DIRECT_THRESHOLD = 0.88
 SEMANTIC_CACHE_OFFLINE_THRESHOLD = 0.80
 CONFIDENCE_HIGH_SIMILARITY_THRESHOLD = 0.80
@@ -280,11 +281,43 @@ def _file_hints(question: str, report: Optional[Dict[str, Any]]) -> List[str]:
         return []
     question_lower = question.lower().replace("\\", "/")
     candidates = report.get("parsedFiles") or []
-    return [
+    return list(dict.fromkeys(
         path for path in candidates
         if path.lower() in question_lower
         or os.path.basename(path).lower() in question_lower
-    ]
+    ))
+
+
+def _topic_file_hints(question: str, report: Optional[Dict[str, Any]]) -> List[str]:
+    """Select bounded implementation files for architecture-topic questions."""
+    if not report:
+        return []
+    question_lower = question.lower().replace("\\", "/")
+    candidates = report.get("parsedFiles") or []
+    hints = []
+    topic_patterns = (
+        (r"\b(runtime|active|actual|configuration|config|settings|yaml|environment)\b",
+         ("config/", "settings.py", ".yaml", ".yml", ".env")),
+        (r"\b(retriev\w*|embedding\w*|chunk\w*|faiss|vector\w*|similarity|top.?k)\b",
+         ("retrieval/", "embed", "chunk", "vector", "config/")),
+        (r"\b(rerank\w*|cross.?encoder)\b",
+         ("rerank", "retrieval/pipeline")),
+        (r"\b(route|middleware|controller|cloudinary|upload|express)\b",
+         ("routes/", "middleware/", "controllers/", "cloudinary", "ai.service")),
+        (r"\b(vision|image|multimodal)\b",
+         ("vision/", "image", "chat.controller", "ai.service")),
+        (r"\b(prompt|llm|generation|sanitiz\w*|model)\b",
+         ("generation/", "prompt", "sanitize", "model.py", "llm")),
+        (r"\b(memory|conversation|history|session)\b",
+         ("memory", "conversation", "session")),
+    )
+    for pattern, path_fragments in topic_patterns:
+        if re.search(pattern, question_lower):
+            hints.extend(
+                path for path in candidates
+                if any(fragment in path.lower() for fragment in path_fragments)
+            )
+    return list(dict.fromkeys(hints))[:12]
 
 
 def _file_hint(question: str, report: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -300,7 +333,7 @@ def _focused_file_matches(repo_path: Optional[str], file_paths: List[str]) -> Li
 
     root = os.path.abspath(repo_path)
     matches = []
-    for relative_path in file_paths[:5]:
+    for relative_path in file_paths[:8]:
         full_path = os.path.abspath(os.path.join(root, relative_path))
         if os.path.commonpath([root, full_path]) != root or not os.path.isfile(full_path):
             continue
@@ -325,7 +358,21 @@ def _usage_identifiers(question: str) -> List[str]:
     if not re.search(r"\b(unused|dead|active|used|usage|reference|imported|enforc)", question, re.IGNORECASE):
         return []
     identifiers = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", question)
+    identifiers.extend(re.findall(
+        r"\b(?:unused|dead|active|used|usage|reference|imported|enforc\w*)"
+        r"\s+(?:code|symbol|function|field|schema|variable|module)?\s*"
+        r"`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        question,
+        re.IGNORECASE,
+    ))
     return list(dict.fromkeys(identifiers))[:3]
+
+
+def _bounded_context(text: str, limit: int = MAX_PROMPT_CONTEXT_CHARS) -> str:
+    """Keep retrieved evidence within the model/document context budget."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n\n[Additional retrieved context omitted due to context limit.]"
 
 
 def _reference_matches(
@@ -812,7 +859,8 @@ def _build_guided_change_prompt(
         "- Output an ordered, numbered list (e.g. 1. Create/Modify `path/to/file` - purpose and what to model after the template).\n"
         "- For each step, state the exact file path or proposed file path and explain how it mirrors the template pattern.\n"
         "- Do not state absence as fact. Do not invent non-existent APIs or libraries.\n"
-        "- Ground every file change in the retrieved code blocks and architecture links above.\n\n"
+        "- Ground every file change in the retrieved code blocks and architecture links above.\n"
+        "- Keep the checklist concise and within 1200 words so it can be safely exported to a document.\n\n"
         "Guided Change Checklist:"
     )
 
@@ -890,7 +938,7 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
             citations.append(f"{fp}:{s}-{e}")
             code_blocks_str.append(f"[Code Block {i+1}] File: {fp} (Lines {s}-{e}):\n```\n{c.get('content')}\n```")
 
-        code_context = "\n\n".join(code_blocks_str)
+        code_context = _bounded_context("\n\n".join(code_blocks_str))
 
         code_meta_list = [
             {
@@ -938,6 +986,7 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
 
     # 5. Dual-Vector Code & Diff Retrieval
     file_path_hints = _file_hints(question, report)
+    topic_file_hints = _topic_file_hints(question, report)
     file_path_hint = max(file_path_hints, key=len) if file_path_hints else None
     profile_matches = [] if file_path_hints or not (repo_path and index_id) else await find_relevant_files(repo_path, index_id, question)
     profile_hints = [match["filePath"] for match in profile_matches if match.get("filePath")]
@@ -945,7 +994,10 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
         repo_path=repo_path, question=question, top_k=5, index_id=index_id,
         file_path_hint=file_path_hint, file_path_hints=file_path_hints + profile_hints
     )
-    focused_matches = _focused_file_matches(repo_path, file_path_hints)
+    focused_matches = _focused_file_matches(
+        repo_path,
+        file_path_hints + ([] if file_path_hints else topic_file_hints),
+    )
     reference_matches = _reference_matches(repo_path, report, question)
     retrieved_matches = focused_matches + reference_matches + matches.get("codeMatches", [])
     seen_matches = set()
@@ -983,8 +1035,8 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
             f"Intent Summary: {d.get('content')}"
         )
 
-    code_context = "\n\n".join(code_blocks_str)
-    diff_context = "\n\n".join(diffs_blocks_str)
+    code_context = _bounded_context("\n\n".join(code_blocks_str))
+    diff_context = _bounded_context("\n\n".join(diffs_blocks_str), max(4000, MAX_PROMPT_CONTEXT_CHARS // 5))
 
     code_meta_list = [
         {
@@ -1038,6 +1090,9 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
         "- Answer only the developer's question. Keep the answer short and easy to understand; do not add unrelated features, code, or architecture discussion.\n"
         "- Separate facts directly shown in retrieved code from reasonable inferences. Never present an inference as a confirmed fact.\n"
         "- Explain the architectural reason and technical flow only when it directly answers the question.\n"
+        "- Prefer directly retrieved implementation files and runtime settings over README descriptions or stale configuration files.\n"
+        "- Treat a configuration file as active only when retrieved code loads it or a runtime settings object exposes the same value; otherwise label it stale or unverified.\n"
+        "- For usage/dead-code questions, distinguish a declaration from references and report the exact reference locations found.\n"
         "- Reference exact file names and line ranges when discussing code.\n"
         "- Absence from retrieved snippets is NOT evidence that a component does not exist. Never state that a module/file/component is absent as a fact unless the indexed file inventory directly proves it was excluded and you explain that limitation. If evidence is incomplete, say exactly: 'I found no direct evidence in the currently indexed context; this does not prove the component is absent.'\n"
         "- When the inventory lists a relevant module but snippets were not retrieved, acknowledge the module exists in the index and avoid inventing its implementation details.\n"
@@ -1045,6 +1100,7 @@ async def _resolve_query_plan(repo_path: Optional[str], question: str, refresh: 
         f"- Semantic file-routing candidates for this question: {', '.join(profile_hints) or 'none'}. These candidates only guide retrieval; cite retrieved code, not the candidate list.\n"
         "- If historical diffs provide context on WHY a decision or change was made, highlight it under a '🏛️ Architectural Decision History' section.\n"
         "- Use clean Markdown format with code snippets where helpful.\n\n"
+        "- Keep the answer focused and within 1200 words so it remains suitable for PDF export.\n\n"
         "Answer:"
     )
 
