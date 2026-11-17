@@ -1,0 +1,36 @@
+/* Keep the laptop workspace in view at normal zoom. */
+@media(min-width:1000px){
+ html,body,#root{height:100%;min-height:0}
+ .app-shell{height:100dvh;min-height:0;overflow:hidden}
+ .app-header{height:56px;flex:0 0 56px;padding:0 24px}
+ .app-container{max-width:1600px;min-height:0;padding:0 24px 12px;display:grid;grid-template-columns:280px minmax(0,1fr);grid-template-rows:auto auto minmax(0,1fr) auto;column-gap:24px;flex:1}
+ .workspace-intro{grid-column:1/-1;padding:16px 0;align-items:center}
+ .workspace-intro h1{font-size:24px}
+ .workspace-intro p{margin-top:2px;font-size:13px}
+ .ingestion-card{grid-column:1;grid-row:2/4;min-height:0;margin:0;padding:16px 0;overflow-y:auto;overscroll-behavior:contain;border-bottom:0}
+ .ingestion-header{gap:12px;margin-bottom:14px}
+ .ingestion-header p{line-height:1.5}
+ .ingestion-input-row{flex-wrap:wrap;gap:8px}
+ .ingestion-input{width:100%;flex-basis:100%;padding:10px;font-size:12px}
+ .ingestion-input-row>.btn{flex:1;min-width:0}
+ .stats-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:16px;padding-top:14px}
+ .stats-grid>div:nth-child(2){border-right:0}
+ .stats-grid>div>div:last-child{font-size:22px!important}
+ .tab-bar-container{grid-column:2;grid-row:2;margin:0 0 12px;gap:24px}
+ .tab-btn{min-height:40px;padding-bottom:8px}
+ .workspace-panel{grid-column:2;grid-row:3;min-height:0;overflow:hidden}
+ .workspace-panel[hidden]{display:none}
+ .chat-container{height:100%;min-height:0;max-height:none;margin:0}
+ .chat-container>div:first-child,.chat-container>div:last-child{flex-shrink:0}
+ .chat-container>div:first-child>div:first-child{padding:12px 16px!important}
+ .chat-prompts-bar{padding:8px 12px}
+ .chat-container>div:nth-child(2){min-height:0;padding:18px!important;gap:16px!important;overscroll-behavior:contain}
+ .chat-container>div:last-child{padding:12px 16px!important}
+ .chat-container input{min-height:42px;padding:8px 12px!important}
+ #graph-panel>.card{height:100%;max-width:none!important;margin:0!important;display:flex;flex-direction:column;overflow:hidden}
+ #graph-panel>.card>div:first-child{flex-shrink:0}
+ .grid-dependencies{flex:1;min-height:0;grid-template-columns:minmax(0,1fr) 250px;gap:12px;overflow:hidden}
+ .grid-dependencies>div{min-height:0;overflow-y:auto;overscroll-behavior:contain}
+ .grid-dependencies>div:first-child{max-height:none!important;grid-template-columns:repeat(auto-fill,minmax(150px,1fr))!important;padding:10px!important}
+ .workspace-footer{grid-column:1/-1;grid-row:4;padding:10px 0 0}
+}
