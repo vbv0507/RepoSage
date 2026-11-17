@@ -1,59 +1,15 @@
 import React from 'react';
-
+import { Layers } from 'lucide-react';
 export default function Header({ health, activeRepo }) {
-  const cacheConnected = health?.services?.cache?.connected;
-  const chromaConnected = health?.services?.chroma?.connected;
-  const llmConfigured = health?.services?.llm?.configured;
-
-  return (
-    <header className="app-header">
-      <div className="header-brand">
-        <span style={{ fontSize: '15px', fontWeight: '600', color: '#ffffff', letterSpacing: '-0.01em', whiteSpace: 'nowrap' }}>
-          RepoSage
-        </span>
-        <span className="header-slash" style={{ color: 'var(--border-color)', userSelect: 'none' }}>/</span>
-        <span className="header-subtitle" style={{ fontSize: '13px', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          Architecture Intelligence
-        </span>
-      </div>
-
-      <div className="header-status-group">
-        {activeRepo && (
-          <span className="header-repo-pill" style={{
-            fontSize: '11.5px',
-            color: 'var(--text-muted)',
-            fontFamily: 'monospace',
-            backgroundColor: '#18181b',
-            padding: '3px 8px',
-            borderRadius: '4px',
-            border: '1px solid var(--border-color)',
-            maxWidth: '130px',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap'
-          }}>
-            {activeRepo.split(/[\/\\]/).pop()}
-          </span>
-        )}
-
-        {/* ChromaDB Status */}
-        <div className="header-status-item" style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-          <span className={`status-dot ${chromaConnected ? 'online' : 'offline'}`} />
-          <span style={{ whiteSpace: 'nowrap' }}>{chromaConnected ? 'ChromaDB' : 'Chroma'}</span>
-        </div>
-
-        {/* In-memory Cache Status */}
-        <div className="header-status-item" style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-          <span className={`status-dot ${cacheConnected ? 'online' : 'warning'}`} />
-          <span style={{ whiteSpace: 'nowrap' }}>Cache</span>
-        </div>
-
-        {/* LLM Status */}
-        <div className="header-status-item" style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-          <span className={`status-dot ${llmConfigured ? 'online' : 'warning'}`} />
-          <span style={{ whiteSpace: 'nowrap' }}>{health?.services?.llm?.provider === 'openai' ? 'OpenAI' : 'Gemini'}</span>
-        </div>
-      </div>
-    </header>
-  );
+ const cacheConnected=health?.services?.cache?.connected;
+ const chromaConnected=health?.services?.chroma?.connected;
+ const llmConfigured=health?.services?.llm?.configured;
+ return <header className="app-header">
+ <a href="/" className="header-brand"><span className="brand-mark" aria-hidden="true"><Layers /></span>RepoSage</a>
+ <div className="header-status-group">
+ {activeRepo&&<span className="header-repo-pill" title={activeRepo}>{activeRepo.split(/[\/\\]/).pop()}</span>}
+ <div className="header-status-item" title={chromaConnected?'Vector index connected':'Vector index unavailable'}><span className={`status-dot ${chromaConnected?'online':'offline'}`} /><span>Index</span></div>
+ <div className="header-status-item" title={cacheConnected?'Cache connected':'Cache unavailable'}><span className={`status-dot ${cacheConnected?'online':'warning'}`} /><span>Cache</span></div>
+ <div className="header-status-item" title={llmConfigured?'AI provider configured':'AI provider not configured'}><span className={`status-dot ${llmConfigured?'online':'warning'}`} /><span>{health?.services?.llm?.provider==='openai'?'OpenAI':'Gemini'}</span></div>
+ </div></header>;
 }
